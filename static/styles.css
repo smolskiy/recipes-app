@@ -498,6 +498,14 @@ body.cooking .nav, body.cooking .conn { display: none; }
 .sources { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
 .sources span { font-size: var(--s-12); font-weight: 500; padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); }
 .add-hint { font-size: var(--s-14); color: var(--ink-2); margin: 0; }
+.src-note { display: flex; align-items: center; gap: 6px; margin: 0; font-size: var(--s-14); color: var(--ink-2); }
+.src-note svg { width: 16px; height: 16px; color: var(--cobalt); }
+.bookmarklet {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; cursor: grab;
+  background: var(--cobalt); color: var(--cobalt-ink); font-weight: 700; text-decoration: none; white-space: nowrap;
+}
+.bookmarklet svg { width: 14px; height: 14px; }
+details.limits p { margin: 8px 0 0; }
 details.limits { font-size: var(--s-14); color: var(--ink-2); }
 details.limits summary { cursor: pointer; color: var(--ink-3); }
 details.limits ul { margin: 8px 0 0; padding-left: 18px; }

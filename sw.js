@@ -5,7 +5,7 @@
 
 import { enqueue, extractUrl, syncAll } from './static/sync-core.js';
 
-const VERSION = 'cfe6ca1b5f0c';
+const VERSION = '506e15109168';
 const CACHE = `recipes-shell-${VERSION}`;
 const SHELL = [
   './', 'manifest.webmanifest',
@@ -36,8 +36,13 @@ async function handleShare(url) {
   const text = url.searchParams.get('text') || '';
   const title = url.searchParams.get('title') || '';
   const link = extractUrl(shared) || extractUrl(text) || extractUrl(title);
+  // Выделенный на странице текст (Android: выделить → «Поделиться»): это сам рецепт, а ссылка — откуда он.
+  // Так добавляются рецепты с сайтов, которые пускают только браузеры.
+  const body = (link ? text.replace(link, '') : text).trim();
   try {
-    if (link) await enqueue({ url: link });
+    // Текст рецепта длинный и с цифрами (количества); подпись к видео вроде «Как приготовить сырники» — короче.
+    if (body.length >= 120 && /\d/.test(body)) await enqueue({ text: body, source_url: link ? link.split('#')[0] : null });
+    else if (link) await enqueue({ url: link });
     else if ((text || '').length >= 40) await enqueue({ text });
     else return Response.redirect(scopeUrl('./#/add?url=' + encodeURIComponent(text || shared || title)), 303);
   } catch (e) {

@@ -276,7 +276,8 @@ export function extractUrl(text) {
   return m ? m[0].replace(/[.,;:!?)\]}]+$/, '') : null;
 }
 
-export async function enqueue({ url = '', text = '', force = false }) {
+// source_url — откуда текст, если сайт пускает только браузеры: человек отправил текст страницы, программа её не грузит.
+export async function enqueue({ url = '', text = '', force = false, source_url = null }) {
   url = (url || '').trim();
   text = (text || '').trim();
   if (!url && text && text.length < 300) {
@@ -288,7 +289,8 @@ export async function enqueue({ url = '', text = '', force = false }) {
     url = found || (url.includes('.') ? 'https://' + url : url);
   }
   if (!url && text.length < 40) throw new Error(text ? 'Текст слишком короткий — вставьте рецепт целиком' : 'Вставьте ссылку или текст рецепта');
-  const item = { cid: newId(), url: url || null, text: url ? null : text, force, state: 'pending', created_at: new Date().toISOString(), job: null, error: null };
+  const item = { cid: newId(), url: url || null, text: url ? null : text, source_url: url ? null : (source_url || null), force,
+    state: 'pending', created_at: new Date().toISOString(), job: null, error: null };
   await dbPut('outbox', item);
   emit('outbox');
   return item;
@@ -299,7 +301,7 @@ export async function sendOutbox() {
   let sent = 0;
   for (const it of items) {
     try {
-      const res = await api('/api/device/jobs', { method: 'POST', body: { client_id: it.cid, url: it.url, text: it.text, force: !!it.force } });
+      const res = await api('/api/device/jobs', { method: 'POST', body: { client_id: it.cid, url: it.url, text: it.text, source_url: it.source_url || null, force: !!it.force } });
       Object.assign(it, { state: 'sent', job: res.job, error: null });
       sent++;
     } catch (e) {

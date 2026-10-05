@@ -856,6 +856,10 @@ let addMode = 'url';
 async function renderAdd(params) {
   const limits = await store.limits().catch(() => null);
   const preset = params.get('url') || '';
+  // Из закладки «В рецепты»: текст открытой в браузере страницы и её адрес.
+  const presetText = params.get('text') || '';
+  const presetSrc = params.get('src') || '';
+  if (presetText) { addMode = 'text'; history.replaceState(null, '', '#/add'); }
   if (params.get('shared')) toast('Ссылка добавлена в очередь', 3000);
   const canPaste = !!navigator.clipboard?.readText;
   view.innerHTML = `
@@ -873,7 +877,8 @@ async function renderAdd(params) {
       </div>
       <div id="mode-text" class="field" ${addMode === 'text' ? '' : 'hidden'}>
         <label class="field"><span class="sr-only">Текст рецепта</span>
-          <textarea class="textarea" name="text" rows="8" placeholder="Скопируйте сюда текст рецепта — описание под видео, сообщение из чата, страницу из книги"></textarea></label>
+          <textarea class="textarea" name="text" rows="8" placeholder="Скопируйте сюда текст рецепта — описание под видео, сообщение из чата, страницу из книги">${esc(presetText)}</textarea></label>
+        ${presetSrc ? `<p class="src-note">${icon('link')}Текст со страницы <b>${esc(hostOf(presetSrc))}</b> — ссылка сохранится у рецепта</p>` : ''}
         <button class="btn btn-primary btn-big" type="submit" style="justify-self:start">${icon('text')}Разобрать текст</button>
       </div>
       <p class="form-error" id="add-err" hidden></p>
@@ -884,6 +889,7 @@ async function renderAdd(params) {
         ? (IOS ? 'На iPhone: скопируйте ссылку в YouTube или Instagram и нажмите «Вставить». ' : 'Удобнее всего — «Поделиться → Рецепты» прямо из YouTube или Instagram. ')
           + 'Без связи с компьютером ссылка подождёт в очереди и уйдёт сама.'
         : 'Рецепт разбирает этот компьютер, обычно за 1–3 минуты.'}</p>
+      <details class="limits"><summary>Сайт «пускает только браузеры»?</summary>${browserOnlyHelp()}</details>
       ${limits ? `<details class="limits"><summary>Ограничения</summary><ul>
         <li>Видео до ${limits.max_video_minutes} минут — у более длинных используются только описание и субтитры.</li>
         <li>Аудио до ${limits.max_audio_mb} МБ, видео для чтения кадров до ${limits.max_video_mb} МБ, не больше ${limits.max_frames} кадров.</li>
@@ -895,6 +901,8 @@ async function renderAdd(params) {
     <div class="jobs" id="jobs"></div>`;
 
   const form = $('#add-form');
+  if (presetSrc) form.dataset.src = presetSrc;
+  $('.bookmarklet')?.addEventListener('click', (e) => { e.preventDefault(); toast('Перетащите кнопку на панель закладок браузера', 3500); });
   $$('.seg button', form).forEach((b) => b.addEventListener('click', () => {
     addMode = b.dataset.mode;
     $$('.seg button', form).forEach((x) => x.setAttribute('aria-pressed', x.dataset.mode === addMode));
@@ -926,11 +934,14 @@ async function renderAdd(params) {
 async function submitJob(form, force) {
   const err = $('#add-err');
   err.hidden = true;
-  const body = addMode === 'url' ? { url: form.url.value.trim(), force } : { text: form.text.value.trim(), force };
+  const body = addMode === 'url' ? { url: form.url.value.trim(), force }
+    : { text: form.text.value.trim(), force, ...(form.dataset.src ? { source_url: form.dataset.src } : {}) };
   if (!(body.url || body.text)) { err.textContent = addMode === 'url' ? 'Вставьте ссылку' : 'Вставьте текст рецепта'; err.hidden = false; return; }
   try {
     await store.addJob(body);
     form.reset();
+    delete form.dataset.src;
+    $('.src-note')?.remove();
     toast(DEVICE ? 'Добавлено в очередь — отправится на компьютер' : 'Добавлено в очередь');
     refreshBadge();
     await loadJobs();
@@ -945,6 +956,25 @@ async function submitJob(form, force) {
       err.hidden = false;
     }
   }
+}
+
+// Сайты с защитой от программ (например, lenta.com) отдают страницу только браузеру. Тогда рецепт отправляет
+// сам браузер: выделенный текст через «Поделиться», вставка из буфера или закладка «В рецепты» на компьютере.
+function bookmarkletHref() {
+  const target = `${location.origin}${location.pathname}#/add?src=`;
+  return `javascript:(function(){var t=(String(getSelection())||document.body.innerText).slice(0,40000);`
+    + `window.open('${target}'+encodeURIComponent(location.href)+'&text='+encodeURIComponent(t),'_blank')})()`;
+}
+
+function browserOnlyHelp() {
+  const phone = `<li><b>Android:</b> откройте рецепт в браузере, выделите его текст и нажмите «Поделиться → Рецепты».</li>
+    <li><b>iPhone:</b> выделите и скопируйте текст рецепта, затем здесь нажмите «Вставить».</li>`;
+  return `<ul>${phone}
+    ${DEVICE ? '' : `<li><b>Компьютер:</b> перетащите эту кнопку на панель закладок браузера —
+      <a class="bookmarklet" href="${esc(bookmarkletHref())}">${icon('plus')}В рецепты</a>.
+      Потом на странице с рецептом нажмите закладку: откроется эта страница с текстом, останется «Разобрать текст».
+      Можно сначала выделить только сам рецепт.</li>`}</ul>
+    <p class="muted">Ссылка на страницу сохранится у рецепта. Саму страницу программа не загружает — это делает ваш браузер.</p>`;
 }
 
 const JOB_ICON = { youtube: 'play', instagram: 'play', tiktok: 'play', vk: 'play', rutube: 'play', dzen: 'play', text: 'text' };
@@ -1704,19 +1734,20 @@ function chainRow(c) {
   </div>`;
 }
 
-const VPN_HELP = `<details class="vpn-help"><summary>Пятёрочка или Лента «не пускают»? Как исправить</summary>
-  <p>Эти сайты отвечают только российским адресам, а запросы компьютера идут через VPN. Нужно, чтобы сайты магазинов открывались мимо VPN:</p>
+const VPN_HELP = `<details class="vpn-help"><summary>Пятёрочка «не пускает»? Как исправить</summary>
+  <p>Сайт Пятёрочки отвечает только российским адресам, а запросы компьютера идут через VPN. Нужно, чтобы сайты магазинов открывались мимо VPN:</p>
   <ol>
     <li>Откройте AmneziaVPN → «Настройки» → «Соединение» → «Раздельное туннелирование» (для сайтов). Названия пунктов могут немного отличаться в вашей версии.</li>
     <li>Включите его в режиме «Адреса из списка не должны открываться через VPN».</li>
-    <li>Добавьте: <b>5ka.ru</b>, <b>5d.5ka.ru</b>, <b>lenta.com</b>, <b>magnit.ru</b>.</li>
-    <li>Переподключите VPN и нажмите здесь «Проверить» у Пятёрочки и Ленты, затем «Магазин», чтобы выбрать ближайший.</li>
+    <li>Добавьте: <b>5ka.ru</b>, <b>5d.5ka.ru</b>, <b>magnit.ru</b>.</li>
+    <li>Переподключите VPN и нажмите здесь «Проверить» у Пятёрочки, затем «Магазин», чтобы выбрать ближайший.</li>
   </ol>
-  <p class="muted">YouTube и всё остальное продолжат идти через VPN.</p></details>`;
+  <p class="muted">YouTube и всё остальное продолжат идти через VPN. Лента так не заработает: её сайт пускает только браузеры, с VPN и без.</p></details>`;
 
 function storesPanel(g) {
   window.__chains = g.items;
-  const blocked = g.items.some((c) => (c.status && !c.status.ok) || /VPN|не пускает|антибот/i.test(c.catalog?.error || ''));
+  // Подсказка про VPN — только когда сайт отказал именно из-за VPN (Пятёрочка), а не из-за защиты от программ.
+  const blocked = g.items.some((c) => /VPN/.test(c.status?.message || c.catalog?.error || '') && !/ни при чём/.test(c.status?.message || ''));
   return `<section class="panel wide"><h3>Магазины</h3>
     <p class="small" style="margin:0">Адрес, рядом с которым искать магазины: <b>${esc(g.location?.label || '—')}</b></p>
     <form id="loc-form" class="add-row"><input class="input" name="q" placeholder="Город, улица, дом" autocomplete="street-address"><button class="btn" type="submit">Найти</button></form>
