@@ -160,12 +160,16 @@ async function renderConn() {
   let extra = '';
   if (state === 'unpaired') main = 'Приложение не подключено к компьютеру';
   else if (state === 'auth') main = 'Компьютер отключил этот телефон — подключите заново';
-  else if (isOnline(state)) main = `Компьютер на связи · ${state === 'lan' ? 'дома' : 'через интернет'}`;
+  else if (isOnline(state) && c.conn?.paused) {
+    main = 'Компьютер на связи · обработка на паузе';
+    extra = c.pending ? queueText(c.pending) : 'ссылки подождут';
+  } else if (isOnline(state)) main = `Компьютер на связи · ${state === 'lan' ? 'дома' : 'через интернет'}`;
   else if (state === 'offline') {
     main = c.conn?.reason === 'nonet' ? 'Нет интернета на телефоне' : 'Компьютер недоступен';
     extra = c.pending ? queueText(c.pending) : c.lastOnline ? `был на связи ${fmtAgo(c.lastOnline)}` : 'рецепты на телефоне доступны';
   } else main = 'Проверяю связь с компьютером…';
   connEl.dataset.state = state;
+  connEl.dataset.paused = isOnline(state) && c.conn?.paused ? '1' : '';
   connEl.innerHTML = `<i class="dot" aria-hidden="true"></i><span>${esc(main)}</span>${extra ? `<small>${esc(extra)}</small>` : ''}`;
   connEl.hidden = false;
   document.body.classList.add('has-conn');
@@ -1115,10 +1119,27 @@ async function renderSystem() {
   view.innerHTML = `<header class="page-head"><h1 class="h1">Система</h1></header><div class="sys-grid" id="sys"><div class="skeleton"></div><div class="skeleton"></div></div>`;
   const [s, g, devs, net, cloud] = await Promise.all([store.system(), store.chains(), store.devices(),
     store.net().catch(() => null), store.cloud().catch(() => null)]);
-  $('#sys').innerHTML = phonesPanel(devs.items, net) + netPanel(net) + cloudPanel(cloud) + systemPanels(s, g);
+  $('#sys').innerHTML = pausePanel(s.pause) + phonesPanel(devs.items, net) + netPanel(net) + cloudPanel(cloud) + systemPanels(s, g);
+  $('#pause-toggle')?.addEventListener('click', async (e) => {
+    e.currentTarget.disabled = true;
+    try {
+      const st = await store.api('api/pause', { method: 'PUT', body: { paused: !s.pause?.paused } });
+      toast(st.paused ? 'Пауза: видеокарта свободна, ссылки ждут в очереди' : 'Обработка продолжается', 3500);
+    } catch (ex) { toast(ex.message); }
+    renderSystem();
+  });
   bindSystemPanels(g);
   bindPhonePanels();
   bindCloudPanel();
+}
+
+function pausePanel(p) {
+  if (!p) return '';
+  return `<section class="panel wide pause-panel"><h3>Пауза для игр ${p.paused ? '<span class="bad">включена</span>' : '<span class="ok">выключена</span>'}</h3>
+    <p class="small" style="margin:0">${p.paused
+    ? `С ${esc(fmtDate(p.since))} новые ссылки не разбираются, модель выгружена из видеопамяти. Телефоны видят компьютер и синхронизируются, ссылки ждут в очереди. После перезагрузки компьютера пауза снимается сама.`
+    : 'На время игры обработку можно приостановить: видеокарта освободится, телефоны продолжат работать, а ссылки подождут в очереди. То же самое — game-on.cmd и game-off.cmd в папке программы.'}</p>
+    <button class="btn ${p.paused ? 'btn-primary' : ''}" id="pause-toggle" style="justify-self:start">${p.paused ? 'Продолжить обработку' : 'Поставить на паузу'}</button></section>`;
 }
 
 function cloudPanel(c) {
@@ -1437,6 +1458,7 @@ function connCardHtml(c, diag, checking) {
       <div><b>${esc(title)}</b><small>${esc(sub)}</small></div></div>
     ${rows.length ? `<ul class="diag">${rows.join('')}</ul>` : ''}
     ${hint ? `<p class="small" style="margin:0">${esc(hint)}</p>` : ''}
+    ${online && c.conn?.paused && !checking ? '<p class="small" style="margin:0"><b>Обработка на паузе</b> — компьютер сейчас занят (например, играми). Ссылки принимаются и разберутся, когда паузу снимут.</p>' : ''}
     ${c.pending ? `<p class="small" style="margin:0"><b>${esc(queueText(c.pending))}</b> — уйдут на компьютер, как только он появится.</p>` : ''}
     ${state === 'auth' ? '<a class="btn btn-primary" href="#/pair?again=1" style="justify-self:start">Подключить заново</a>' : ''}
     <div class="btn-row"><button class="btn" id="check-now" ${checking ? 'disabled' : ''}>${icon('refresh')}Проверить связь</button></div>`;

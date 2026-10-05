@@ -440,6 +440,7 @@ details.limits ul { margin: 8px 0 0; padding-left: 18px; }
 .conn small { font-size: inherit; font-weight: 500; color: var(--ink-3); flex-shrink: 1; }
 .conn small::before { content: "· "; }
 .conn[data-state="offline"] { background: var(--butter-soft); color: var(--ink); }
+.conn[data-paused="1"] { background: var(--cobalt-soft); color: var(--ink); }
 .conn[data-state="unpaired"], .conn[data-state="auth"] { background: var(--tomato-soft); color: var(--ink); }
 body[data-route="pair"] .conn { display: none; }
 body.has-conn .view { padding-bottom: calc(var(--nav-h) + 64px + env(safe-area-inset-bottom)); }

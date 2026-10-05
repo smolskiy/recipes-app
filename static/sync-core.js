@@ -105,7 +105,8 @@ async function probe(ep, token, ms = 3500) {
   if (r.status === 401) throw new AuthError('Телефон отключён на компьютере. Подключите его заново.');
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   if (ep.kind === 'lan') await kv.set('lanOk', true);
-  return ep;
+  const data = await r.json().catch(() => ({}));
+  return { ...ep, paused: !!data.paused }; // paused — на компьютере включена пауза обработки (игры)
 }
 
 // Адрес ПК считается рабочим 20 секунд, дальше — новая проверка (иначе выключенный ПК долго выглядит «на связи»).
@@ -126,8 +127,8 @@ export async function connect(force = false) {
   for (const group of await groups(list)) {
     const results = await Promise.allSettled(group.map((ep) => probe(ep, token)));
     authErr ||= results.find((r) => r.status === 'rejected' && r.reason instanceof AuthError)?.reason;
-    const ok = results.findIndex((r) => r.status === 'fulfilled');
-    if (ok >= 0) { found = group[ok]; break; }
+    const ok = results.find((r) => r.status === 'fulfilled');
+    if (ok) { found = ok.value; break; }
   }
   if (!found) {
     current = null;
@@ -138,7 +139,7 @@ export async function connect(force = false) {
   }
   current = { ...found, at: Date.now() };
   await kv.set('lastEndpoint', { url: current.url, kind: current.kind });
-  await setConn({ state: current.kind, endpoint: current.url });
+  await setConn({ state: current.kind, endpoint: current.url, paused: !!found.paused });
   return current;
 }
 
@@ -166,8 +167,8 @@ export async function diagnose() {
   const check = async (ep) => {
     const t0 = performance.now();
     try {
-      await probe(ep, token, 6000);
-      return { ...ep, ok: true, ms: Math.round(performance.now() - t0) };
+      const r = await probe(ep, token, 6000);
+      return { ...ep, ok: true, ms: Math.round(performance.now() - t0), paused: r.paused };
     } catch (e) {
       const timeout = e.name === 'TimeoutError' || e.name === 'AbortError';
       return { ...ep, ok: false, auth: e instanceof AuthError, error: e instanceof AuthError ? e.message : timeout ? 'нет ответа' : 'не удалось соединиться' };
@@ -186,7 +187,7 @@ export async function diagnose() {
   if (ok) {
     current = { url: ok.url, kind: ok.kind, at: Date.now() };
     await kv.set('lastEndpoint', { url: ok.url, kind: ok.kind });
-    await setConn({ state: ok.kind, endpoint: ok.url });
+    await setConn({ state: ok.kind, endpoint: ok.url, paused: !!ok.paused });
   } else if (token) {
     current = null;
     const auth = items.some((i) => i.auth);
