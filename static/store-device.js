@@ -217,6 +217,9 @@ export const deviceStore = {
     };
   },
   sync: (reason) => core.syncAll(reason),
+  check: () => core.connect(true).then(() => true, () => false),
+  diagnose: () => core.diagnose(),
+  markNoNetwork: () => core.markNoNetwork(),
   pair: (base, code, name) => core.pair(base, code, name),
   unpair: () => core.unpair(),
 };

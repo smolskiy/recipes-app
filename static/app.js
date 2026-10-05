@@ -140,19 +140,35 @@ async function refreshBadge() {
 }
 
 const CONN_TEXT = { lan: 'Дома', wan: 'Через интернет', offline: 'Нет связи с ПК', unpaired: 'Не подключено', unknown: 'Проверяю связь' };
+const isOnline = (state) => state === 'lan' || state === 'wan';
+function connState(c) {
+  if (!c.paired) return 'unpaired';
+  if (c.authLost) return 'auth';
+  return c.conn?.state || 'unknown';
+}
+const queueText = (n) => `${n} ${plural(n, ['ссылка ждёт', 'ссылки ждут', 'ссылок ждут'])} отправки`;
+
+// Строка состояния над меню: видна всегда, чтобы было понятно, доступен ли компьютер прямо сейчас.
 async function renderConn() {
   if (!DEVICE) return;
   const c = await store.connection();
-  const state = !c.paired ? 'unpaired' : c.conn?.state || 'unknown';
+  const state = connState(c);
   const navItem = document.querySelector('[data-nav="system"]');
-  navItem.dataset.conn = state;
-  navItem.title = `${CONN_TEXT[state] || state}${c.lastSync ? `, синхронизация ${fmtAgo(c.lastSync)}` : ''}`;
-  // Полоса над меню — только когда связи нет.
-  connEl.hidden = !(state === 'offline' || state === 'unpaired' || c.authLost);
+  navItem.dataset.conn = state === 'auth' ? 'unpaired' : state;
+  navItem.title = `${CONN_TEXT[state] || ''}${c.lastSync ? `, синхронизация ${fmtAgo(c.lastSync)}` : ''}`;
+  let main;
+  let extra = '';
+  if (state === 'unpaired') main = 'Приложение не подключено к компьютеру';
+  else if (state === 'auth') main = 'Компьютер отключил этот телефон — подключите заново';
+  else if (isOnline(state)) main = `Компьютер на связи · ${state === 'lan' ? 'дома' : 'через интернет'}`;
+  else if (state === 'offline') {
+    main = c.conn?.reason === 'nonet' ? 'Нет интернета на телефоне' : 'Компьютер недоступен';
+    extra = c.pending ? queueText(c.pending) : c.lastOnline ? `был на связи ${fmtAgo(c.lastOnline)}` : 'рецепты на телефоне доступны';
+  } else main = 'Проверяю связь с компьютером…';
   connEl.dataset.state = state;
-  connEl.textContent = c.authLost ? 'Компьютер отключил этот телефон — подключите заново'
-    : state === 'unpaired' ? 'Приложение не подключено к компьютеру'
-      : `Нет связи с домашним компьютером${c.pending ? ` — ${c.pending} ${plural(c.pending, ['ссылка ждёт', 'ссылки ждут', 'ссылок ждут'])} в очереди` : '. Рецепты доступны'}`;
+  connEl.innerHTML = `<i class="dot" aria-hidden="true"></i><span>${esc(main)}</span>${extra ? `<small>${esc(extra)}</small>` : ''}`;
+  connEl.hidden = false;
+  document.body.classList.add('has-conn');
 }
 
 // ---------- Маршрутизация ----------
@@ -162,6 +178,7 @@ async function route() {
   currentCleanup = null;
   const { path, params } = parseHash();
   const parts = path.split('/').filter(Boolean);
+  document.body.dataset.route = parts[0] || 'list';
   let nav = 'list';
   try {
     if (DEVICE && parts[0] !== 'pair' && !(await store.paired())) {
@@ -846,52 +863,252 @@ async function renderEdit(key) {
 // =====================================================================
 // Привязка телефона (режим телефона)
 // =====================================================================
+const UA = navigator.userAgent;
+const IOS = /iP(hone|ad|od)/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const ANDROID = /Android/.test(UA);
+const STANDALONE = NATIVE || navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+const defaultName = () => (/iPhone/.test(UA) ? 'iPhone' : IOS ? 'iPad' : ANDROID ? 'Android' : 'Телефон');
+const SHARE_ICON = '<svg class="inline-ico" aria-label="Поделиться"><use href="#i-share"/></svg>';
+
+// iPhone хранит данные Safari и приложения с экрана «Домой» раздельно. Код из ссылки кладём в cookie на 15 минут
+// (столько живёт код): если iOS перенесёт её в установленное приложение, оно подключится само; если нет —
+// в приложении сканируют тот же QR-код.
+const HANDOFF = 'recipes_pair';
+const cookieAttrs = () => `; path=${location.pathname.replace(/[^/]*$/, '')}; secure; samesite=strict`;
+function saveHandoff(pc, code) {
+  document.cookie = `${HANDOFF}=${encodeURIComponent(JSON.stringify({ pc, code }))}; max-age=900${cookieAttrs()}`;
+}
+function readHandoff() {
+  const m = document.cookie.match(new RegExp(`(?:^|; )${HANDOFF}=([^;]*)`));
+  try { return m ? JSON.parse(decodeURIComponent(m[1])) : null; } catch { return null; }
+}
+function clearHandoff() { document.cookie = `${HANDOFF}=; max-age=0${cookieAttrs()}`; }
+
+// Ссылка из QR-кода: «…/#/pair?pc=…&code=…» (приложение с GitHub Pages) или «https://ПК/#/pair?code=…».
+function parsePairLink(text) {
+  try {
+    const u = new URL(String(text).trim());
+    const q = new URLSearchParams(u.hash.split('?')[1] || '');
+    const code = q.get('code');
+    return code ? { pc: q.get('pc') || u.origin, code } : null;
+  } catch { return null; }
+}
+
+function friendlyPairError(e) {
+  return e.name === 'TypeError' || e.name === 'TimeoutError' || /fetch|network|load failed/i.test(e.message)
+    ? 'Компьютер не отвечает по этому адресу. Проверьте, что он включён, и попробуйте ещё раз.' : e.message;
+}
+
+async function doPair(pc, code, name) {
+  await store.pair(pc, code, name || defaultName());
+  clearHandoff();
+  history.replaceState(null, '', '#/pair?done=1'); // использованный код из адреса убираем
+  await renderConn();
+  store.sync('paired');
+}
+
+let jsqrLoading = null;
+function loadJsQR() {
+  return (jsqrLoading ||= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'static/vendor/jsQR.js';
+    s.onload = () => resolve(window.jsQR);
+    s.onerror = () => { jsqrLoading = null; reject(new Error('Не удалось загрузить распознавание QR-кода — проверьте интернет')); };
+    document.head.append(s);
+  }));
+}
+
+// Сканер QR-кода камерой: BarcodeDetector (Android Chrome) или jsQR (iPhone и остальные).
+async function scanQr() {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Камера недоступна в этом браузере — введите код вручную');
+  let detector = null;
+  if ('BarcodeDetector' in window) {
+    try { if ((await BarcodeDetector.getSupportedFormats()).includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch { /* нет */ }
+  }
+  const decodeLib = detector ? null : await loadJsQR();
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+  } catch (e) {
+    throw new Error(e.name === 'NotAllowedError'
+      ? 'Нет доступа к камере. Разрешите камеру для этого приложения в настройках телефона или введите код вручную.'
+      : 'Не удалось включить камеру — введите код вручную');
+  }
+  let done = false;
+  let found = null;
+  const closed = openDialog(`
+    <h3>Наведите камеру на QR-код</h3>
+    <div class="scan-box"><video playsinline muted autoplay></video><i class="scan-frame" aria-hidden="true"></i></div>
+    <p class="small">QR-код — на экране компьютера: «Система → Подключить телефон».</p>
+    <form method="dialog" class="dialog-actions"><button class="btn" value="cancel">Отмена</button></form>`);
+  const video = $('video', dialog);
+  video.srcObject = stream;
+  video.play().catch(() => {});
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const tick = async () => {
+    if (done) return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      try {
+        let text = null;
+        if (detector) text = (await detector.detect(video))[0]?.rawValue || null;
+        else {
+          const k = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
+          canvas.width = Math.round(video.videoWidth * k);
+          canvas.height = Math.round(video.videoHeight * k);
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          text = decodeLib(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' })?.data || null;
+        }
+        if (text) {
+          const link = parsePairLink(text);
+          if (link) { found = link; dialog.close('ok'); return; }
+          toast('Это не QR-код подключения — откройте его на компьютере в «Система → Подключить телефон»', 3500);
+        }
+      } catch { /* кадр не распознан */ }
+    }
+    setTimeout(tick, 180);
+  };
+  tick();
+  await closed;
+  done = true;
+  stream.getTracks().forEach((t) => t.stop());
+  return found;
+}
+
+const pairHead = (title) => `<header class="page-head"><h1 class="h1">${esc(title)}</h1></header>`;
+
 async function renderPair(params) {
   const paired = await store.paired();
-  const code = params.get('code') || '';
-  const pc = params.get('pc') || (ORIGIN_IS_PC ? location.origin : '');
-  if (paired && !code) { location.replace('#/system'); return; }
-  view.innerHTML = `
-    <header class="page-head"><h1 class="h1">Подключение к домашнему компьютеру</h1></header>
-    <form class="add-panel" id="pair-form">
-      <p style="margin:0">Рецепты хранятся на этом телефоне, а разбирает ссылки домашний компьютер. Подключите приложение один раз — дальше всё работает само, дома и вне дома.</p>
-      <label class="field"><span>Адрес компьютера</span>
-        <input class="input" name="pc" value="${esc(pc)}" placeholder="https://адрес-компьютера:порт" inputmode="url" autocomplete="off" required></label>
-      <label class="field"><span>Код с компьютера</span>
-        <input class="input" name="code" value="${esc(code)}" placeholder="8 символов" autocomplete="one-time-code" autocapitalize="characters" required></label>
-      <label class="field"><span>Как назвать этот телефон</span>
-        <input class="input" name="name" value="Телефон" maxlength="60"></label>
-      <p class="form-error" id="pair-err" hidden></p>
-      <button class="btn btn-primary" type="submit" style="justify-self:start">${icon('check')}Подключить</button>
-      <p class="muted small" style="margin:0">Код и адрес показаны на компьютере: «Система → Телефоны → Подключить телефон». Код действует 15 минут.</p>
-    </form>`;
-  const form = $('#pair-form');
-  const submit = async () => {
-    const err = $('#pair-err');
-    err.hidden = true;
-    const btn = $('button[type=submit]', form);
-    btn.disabled = true;
+  let code = params.get('code') || '';
+  let pc = params.get('pc') || (ORIGIN_IS_PC ? location.origin : '');
+  const again = params.has('again');
+  if (paired && !code && !again) { location.replace('#/system'); return; }
+  let fromHandoff = false;
+  if (!code && !paired) {
+    const h = readHandoff();
+    if (h?.code && h?.pc) { ({ code, pc } = h); fromHandoff = true; }
+  }
+  // iPhone в Safari: подключение в Safari не перейдёт в приложение на экране «Домой» — сначала установка.
+  if (code && pc && IOS && !STANDALONE && !params.has('safari')) {
+    saveHandoff(pc, code);
+    renderIosInstall(pc, code);
+    return;
+  }
+  if (code && pc) {
+    view.innerHTML = `${pairHead('Подключение')}<section class="panel pair-wait"><span class="spinner" aria-hidden="true"></span><p>Подключаю к домашнему компьютеру…</p></section>`;
     try {
-      await store.pair(form.pc.value.trim(), form.code.value.trim(), form.name.value.trim());
-      toast('Телефон подключён');
-      await renderConn();
-      store.sync('paired');
-      location.replace('#/system');
+      await doPair(pc, code);
+      renderPaired();
     } catch (e) {
-      err.textContent = e.message.includes('Failed to fetch') || e.name === 'TypeError' || e.name === 'TimeoutError'
-        ? 'Компьютер не отвечает по этому адресу. Проверьте адрес и что телефон в домашней Wi-Fi сети.' : e.message;
-      err.hidden = false;
-    } finally { btn.disabled = false; }
+      if (fromHandoff) clearHandoff();
+      renderPairForm({ pc, code: fromHandoff ? '' : code, error: friendlyPairError(e) });
+    }
+    return;
+  }
+  if (!pc) { // подключение заново: подставляем уже известный адрес компьютера
+    const eps = (await store.connection()).endpoints || {};
+    pc = (eps.wan || [])[0] || (eps.lan || [])[0] || '';
+  }
+  renderPairForm({ pc, code: '' });
+}
+
+function renderPairForm({ pc = '', code = '', error = '' }) {
+  const iosSafari = IOS && !STANDALONE;
+  view.innerHTML = `${pairHead('Подключение к компьютеру')}
+    <section class="panel pair-hero">
+      <p style="margin:0">Рецепты хранятся на телефоне, а ссылки разбирает домашний компьютер. Подключите приложение один раз — дальше всё работает само, дома и вне дома.</p>
+      ${iosSafari ? `<div class="notice">${icon('warn')}<div><b>На iPhone сначала добавьте приложение на экран «Домой»:</b> ${SHARE_ICON} «Поделиться» → «На экран Домой». Откройте его оттуда и подключите там — Safari и приложение на экране «Домой» хранят данные раздельно.</div></div>` : ''}
+      <button class="btn btn-primary btn-big" id="scan" type="button">${icon('qr')}Сканировать QR-код</button>
+      <p class="small muted" style="margin:0">QR-код — на экране компьютера: «Система → Подключить телефон».</p>
+      <p class="form-error" id="pair-err" ${error ? '' : 'hidden'}>${esc(error)}</p>
+    </section>
+    <details class="panel manual" ${code || error ? 'open' : ''}>
+      <summary>Ввести адрес и код вручную</summary>
+      <form id="pair-form" style="display:grid;gap:12px;margin-top:12px">
+        <label class="field"><span>Адрес компьютера</span>
+          <input class="input" name="pc" value="${esc(pc.replace(/^https:\/\//, ''))}" placeholder="например 203.0.113.10:8444" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" required></label>
+        <label class="field"><span>Код (8 символов)</span>
+          <input class="input code-input" name="code" value="${esc(code)}" placeholder="XXXX-XXXX" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" required></label>
+        <label class="field"><span>Как назвать этот телефон</span>
+          <input class="input" name="name" value="${esc(defaultName())}" maxlength="60"></label>
+        <button class="btn btn-primary" type="submit" style="justify-self:start">${icon('check')}Подключить</button>
+      </form>
+    </details>`;
+  const err = $('#pair-err');
+  const fail = (e) => { err.textContent = friendlyPairError(e); err.hidden = false; };
+  const run = async (pcUrl, pcCode, name, btn) => {
+    err.hidden = true;
+    btn.disabled = true;
+    try { await doPair(pcUrl, pcCode, name); renderPaired(); } catch (e) { fail(e); } finally { btn.disabled = false; }
   };
-  form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
-  if (code && pc && !paired) submit();
+  $('#scan').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    err.hidden = true;
+    let link;
+    try { link = await scanQr(); } catch (ex) { fail(ex); return; }
+    if (link) run(link.pc, link.code, defaultName(), btn);
+  });
+  const form = $('#pair-form');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    run(form.pc.value, form.code.value, form.name.value.trim(), $('button[type=submit]', form));
+  });
+}
+
+function renderIosInstall(pc, code) {
+  const safariLink = `#/pair?pc=${encodeURIComponent(pc)}&code=${encodeURIComponent(code)}&safari=1`;
+  view.innerHTML = `${pairHead('Установите приложение')}
+    <section class="panel">
+      <p style="margin:0">На iPhone приложение сначала добавляют на экран «Домой» — иначе оно не запомнит подключение к компьютеру.</p>
+      <ol class="steps-list">
+        <li><b>Нажмите ${SHARE_ICON} «Поделиться»</b> на панели Safari.</li>
+        <li><b>Выберите «На экран Домой»</b> (если не видно — прокрутите список ниже) и нажмите «Добавить». Переключатель «Открыть как веб-приложение» оставьте включённым.</li>
+        <li><b>Откройте «Рецепты» с экрана «Домой».</b> Если приложение не подключится само, нажмите в нём «Сканировать QR-код» и наведите камеру на тот же QR-код на компьютере.</li>
+      </ol>
+    </section>
+    <div class="btn-row" style="margin-top:12px"><a class="btn btn-ghost" href="${esc(safariLink)}">Пользоваться в Safari без установки</a></div>`;
+}
+
+function renderPaired() {
+  const install = STANDALONE ? '' : IOS
+    ? `<section class="panel"><h3>Приложение на экране «Домой»</h3>
+        <p class="small" style="margin:0">Сейчас подключён Safari. Если добавите приложение на экран «Домой», подключите его там ещё раз: «Сканировать QR-код».</p></section>`
+    : `<section class="panel"><h3>Установите приложение</h3>
+        <p class="small" style="margin:0">Оно откроется одним касанием с главного экрана и появится в меню «Поделиться» — так удобнее всего отправлять ссылки из YouTube и Instagram.</p>
+        <button class="btn btn-primary" id="install" style="justify-self:start" ${installEvent ? '' : 'hidden'}>${icon('plus')}Установить</button>
+        <p class="small muted" id="install-hint" style="margin:0" ${installEvent ? 'hidden' : ''}>Меню браузера ⋮ → «Установить приложение» или «Добавить на главный экран».</p></section>`;
+  view.innerHTML = `${pairHead('Готово!')}
+    <div class="sys-grid">
+      <section class="panel pair-done">${icon('check')}<div><b>Телефон подключён к компьютеру</b>
+        <p class="small muted" style="margin:0">Рецепты с компьютера загружаются на телефон, новые ссылки будут уходить на обработку сами.</p></div></section>
+      ${install}
+    </div>
+    <div class="btn-row" style="margin-top:16px"><a class="btn btn-primary" href="#/">${icon('book')}К рецептам</a></div>`;
+  bindInstallButton();
+}
+
+function bindInstallButton() {
+  $('#install')?.addEventListener('click', async () => {
+    if (!installEvent) return;
+    installEvent.prompt();
+    await installEvent.userChoice.catch(() => {});
+    installEvent = null;
+    $('#install')?.setAttribute('hidden', '');
+  });
 }
 
 // =====================================================================
 // Система
 // =====================================================================
 let installEvent = null;
-window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvent = e; $('#install')?.removeAttribute('hidden'); });
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installEvent = e;
+  $('#install')?.removeAttribute('hidden');
+  $('#install-hint')?.setAttribute('hidden', '');
+});
+window.addEventListener('appinstalled', () => { installEvent = null; $('#install')?.setAttribute('hidden', ''); toast('Приложение установлено — оно на главном экране'); });
 
 async function renderSystem() {
   if (DEVICE) return renderDeviceSystem();
@@ -956,7 +1173,7 @@ function phonesPanel(devices, net) {
     <button class="btn btn-ghost" style="min-height:34px" data-revoke="${d.id}">Отключить</button></li>`).join('');
   return `<section class="panel wide"><h3>Телефоны с приложением</h3>
     <p class="small" style="margin:0">Приложение хранит рецепты на телефоне и отправляет ссылки сюда, когда видит компьютер — дома по Wi-Fi или через интернет.</p>
-    ${rows ? `<ul class="errlist" style="gap:10px">${rows}</ul>` : '<p class="muted small" style="margin:0">Пока ни одного телефона.</p>'}
+    ${rows ? `<ul class="devlist">${rows}</ul>` : '<p class="muted small" style="margin:0">Пока ни одного телефона.</p>'}
     <div class="btn-row"><button class="btn btn-primary" id="pair-new">${icon('plus')}Подключить телефон</button>
     <a class="btn" href="#/phone">Инструкция для телефона</a></div></section>`;
 }
@@ -984,6 +1201,8 @@ function netPanel(net) {
       <dt>Сертификат Let's Encrypt</dt><dd>${a.valid_until ? `<span class="ok">до ${esc(fmtDate(a.valid_until))}</span>, продлевается сам` : '<span class="bad">нет</span>'}</dd>
       ${a.last_error ? `<dt>Последняя ошибка</dt><dd class="bad">${esc(a.last_error)}</dd>` : ''}
       ${t ? `<dt>Свой сертификат (дом)</dt><dd>до ${esc(fmtDate(t.valid_until))}</dd>` : ''}</dl>
+    ${net.endpoints.wan.length ? `<div style="display:grid;gap:8px"><button class="btn" id="net-check" type="button" style="justify-self:start">${icon('refresh')}Проверить доступ из интернета</button>
+      <div id="net-check-res"></div></div>` : ''}
     ${net.public_host ? `<form id="acme-form" style="display:grid;gap:8px">
       <label class="check small"><input type="checkbox" name="agree"> Я принимаю <a href="${esc(a.terms_url)}" target="_blank" rel="noopener noreferrer">соглашение подписчика Let's Encrypt</a></label>
       <label class="field"><span>Почта для уведомлений Let's Encrypt (необязательно)</span><input class="input" name="email" type="email" autocomplete="email"></label>
@@ -1010,6 +1229,20 @@ function bindPhonePanels() {
       renderSystem();
     } catch (ex) { err.textContent = ex.message; err.hidden = false; }
   });
+  $('#net-check')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const out = $('#net-check-res');
+    btn.disabled = true;
+    out.innerHTML = '<p class="small muted wait-line"><span class="spinner small" aria-hidden="true"></span>Обращаюсь к компьютеру по внешнему адресу…</p>';
+    try {
+      const res = await store.api('api/net/check', { method: 'POST' });
+      out.innerHTML = `<ul class="diag">${res.items.map((i) => `<li class="${i.ok ? 'is-ok' : 'is-bad'}">${icon(i.ok ? 'check' : 'warn')}
+        <span><b>${esc(shortUrl(i.url))}</b></span><em>${i.ok ? `отвечает, ${i.ms} мс` : esc(i.error)}</em></li>`).join('')}</ul>
+        <p class="small muted" style="margin:0">${res.ok ? 'Проброс порта и сертификат в порядке.' : 'Проверка идёт изнутри домашней сети.'}
+        Окончательно проверить можно с телефона без Wi-Fi: «Связь» → «Проверить связь».</p>`;
+    } catch (ex) { out.innerHTML = `<p class="form-error">${esc(ex.message)}</p>`; }
+    btn.disabled = false;
+  });
   $('#acme-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const err = $('#acme-err');
@@ -1028,18 +1261,45 @@ function bindPhonePanels() {
   });
 }
 
+const PAIR_STEPS = `<ol class="steps-list small">
+      <li><b>Android:</b> наведите камеру телефона на QR-код и откройте ссылку — приложение подключится само, затем нажмите «Установить».</li>
+      <li><b>iPhone:</b> откройте ссылку из камеры в Safari, добавьте приложение на экран «Домой» (подсказка появится), откройте его и нажмите «Сканировать QR-код».</li>
+      <li><b>Приложение уже установлено:</b> «Связь» → «Подключить заново» → «Сканировать QR-код».</li>
+    </ol>`;
+
 async function showPairDialog() {
   let code;
   try { code = await store.pairCode(); } catch (e) { toast(e.message); return; }
+  const before = new Set((await store.devices().catch(() => ({ items: [] }))).items.map((d) => d.id));
   const url = code.app_url;
-  await openDialog(`
+  let open = true;
+  const closed = openDialog(`
     <h3>Подключить телефон</h3>
-    <p>Откройте камерой телефона этот код или введите в приложении:</p>
-    ${url ? `<img src="api/qr?text=${encodeURIComponent(url)}" alt="QR-код для подключения" style="width:220px;height:220px;justify-self:center;border-radius:12px">` : ''}
-    <div class="addr" style="text-align:center;letter-spacing:.12em">${esc(code.code.slice(0, 4))}-${esc(code.code.slice(4))}</div>
-    <p class="small muted">Код действует 15 минут и подходит для одного телефона. ${url ? `Адрес приложения: ${esc(url.split('/#')[0])}` : ''}</p>
-    <p class="small">Если телефон пишет, что подключение небезопасно, сначала установите на него сертификат — см. «Инструкция для телефона».</p>
-    <form method="dialog" class="dialog-actions"><button class="btn" value="ok">Готово</button></form>`);
+    <div id="pair-live" style="display:grid;gap:12px">
+      ${url ? `<img class="pair-qr" src="api/qr?text=${encodeURIComponent(url)}" alt="QR-код для подключения">` : ''}
+      ${PAIR_STEPS}
+      <details class="small"><summary>Ввести вручную</summary>
+        <dl class="kv" style="margin-top:8px"><dt>Адрес</dt><dd>${esc(shortUrl(code.pc || ''))}</dd>
+        <dt>Код</dt><dd><b class="code-big">${esc(code.code.slice(0, 4))}-${esc(code.code.slice(4))}</b></dd></dl></details>
+      <p class="small muted wait-line"><span class="spinner small" aria-hidden="true"></span>Жду телефон… Код действует 15 минут и подходит для одного телефона.</p>
+    </div>
+    <form method="dialog" class="dialog-actions"><button class="btn" value="ok">Закрыть</button></form>`);
+  // Как только телефон подключился — показываем это здесь же.
+  const poll = async () => {
+    if (!open) return;
+    try {
+      const added = (await store.devices()).items.find((d) => !d.revoked && !before.has(d.id));
+      if (added && open) {
+        $('#pair-live').innerHTML = `<div class="pair-done">${icon('check')}<div><b>«${esc(added.name)}» подключён</b>
+          <p class="small muted" style="margin:0">Рецепты уже загружаются на телефон. Окно можно закрыть.</p></div></div>`;
+        return;
+      }
+    } catch { /* повторим */ }
+    setTimeout(poll, 2000);
+  };
+  setTimeout(poll, 2000);
+  await closed;
+  open = false;
   renderSystem();
 }
 
@@ -1144,31 +1404,75 @@ function chainRow(c) {
   </div>`;
 }
 
+function shortUrl(u) { return String(u || '').replace(/^https?:\/\//, ''); }
+
+function connCardHtml(c, diag, checking) {
+  const state = connState(c);
+  const online = isOnline(state);
+  const nonet = state === 'offline' && c.conn?.reason === 'nonet';
+  const title = checking ? 'Проверяю связь…'
+    : state === 'auth' ? 'Компьютер отключил этот телефон'
+      : online ? 'Компьютер на связи' : nonet ? 'Нет интернета на телефоне' : state === 'offline' ? 'Компьютер недоступен' : 'Связь ещё не проверялась';
+  const okItem = diag?.items.find((i) => i.ok);
+  const sub = checking ? 'Опрашиваю адреса компьютера'
+    : online ? `${state === 'lan' ? 'Дома, по Wi-Fi' : 'Через интернет'}${okItem ? ` · ответ за ${okItem.ms} мс` : ''} · проверено ${fmtAgo(c.conn?.at)}`
+      : c.lastOnline ? `Последний раз на связи ${fmtAgo(c.lastOnline)}` : 'Ещё ни разу не был на связи';
+  const kindLabel = (k) => (k === 'lan' ? 'Дома (Wi-Fi)' : 'Через интернет');
+  // Если связь есть, неотвечающие запасные адреса — не ошибка: показываем их приглушённо.
+  const rows = (diag?.items || []).map((i) => `<li class="${i.ok ? 'is-ok' : diag.ok ? 'is-idle' : 'is-bad'}">
+      ${icon(i.ok ? 'check' : 'warn')}<span><b>${kindLabel(i.kind)}</b> <small>${esc(shortUrl(i.url))}</small></span>
+      <em>${i.ok ? `${i.ms} мс` : diag.ok ? `${esc(i.error)} — не нужен` : esc(i.error)}</em></li>`);
+  if (diag && diag.internet !== null) {
+    rows.push(`<li class="${diag.internet ? 'is-ok' : 'is-bad'}">${icon(diag.internet ? 'check' : 'warn')}<span><b>Интернет на телефоне</b></span><em>${diag.internet ? 'есть' : 'нет'}</em></li>`);
+  }
+  let hint = '';
+  if (!checking && diag && !diag.ok && state !== 'auth') {
+    hint = diag.internet === false
+      ? 'Телефон не в сети. Рецепты доступны, а новые ссылки отправятся сами, когда появится интернет.'
+      : 'Компьютер не отвечает: он выключен, спит, не запущен сервер или дома пропал интернет. Рецепты на телефоне доступны, новые ссылки сохранятся и отправятся сами, когда компьютер появится.';
+    if (diag.skippedLan && diag.internet !== false) hint += ' Домашний адрес не проверялся: приложение ходит к компьютеру через интернет — так работает и дома, и вне дома.';
+  }
+  const dotState = checking ? 'unknown' : state;
+  return `<div class="conn-head" data-state="${dotState}"><i class="dot big" aria-hidden="true"></i>
+      <div><b>${esc(title)}</b><small>${esc(sub)}</small></div></div>
+    ${rows.length ? `<ul class="diag">${rows.join('')}</ul>` : ''}
+    ${hint ? `<p class="small" style="margin:0">${esc(hint)}</p>` : ''}
+    ${c.pending ? `<p class="small" style="margin:0"><b>${esc(queueText(c.pending))}</b> — уйдут на компьютер, как только он появится.</p>` : ''}
+    ${state === 'auth' ? '<a class="btn btn-primary" href="#/pair?again=1" style="justify-self:start">Подключить заново</a>' : ''}
+    <div class="btn-row"><button class="btn" id="check-now" ${checking ? 'disabled' : ''}>${icon('refresh')}Проверить связь</button></div>`;
+}
+
 async function renderDeviceSystem() {
   const c = await store.connection();
-  const state = c.conn?.state || 'unknown';
   view.innerHTML = `<header class="page-head"><h1 class="h1">Связь и система</h1></header>
     <div class="sys-grid" id="sys">
-      <section class="panel wide"><h3>Домашний компьютер <span class="${['lan', 'wan'].includes(state) ? 'ok' : 'bad'}">${esc(CONN_TEXT[state] || state)}</span></h3>
+      <section class="panel wide conn-card" id="conn-card">${connCardHtml(c, null, true)}</section>
+      <section class="panel wide"><h3>Этот телефон</h3>
         <dl class="kv">
-          <dt>Телефон</dt><dd>${esc(c.device?.name || '—')}</dd>
-          <dt>Адрес</dt><dd>${esc(c.conn?.endpoint || '—')}</dd>
-          <dt>Последняя синхронизация</dt><dd>${esc(fmtAgo(c.lastSync))}</dd>
+          <dt>Название</dt><dd>${esc(c.device?.name || '—')}</dd>
           <dt>Рецептов на телефоне</dt><dd>${c.recipes}</dd>
+          <dt>Последняя синхронизация</dt><dd>${esc(fmtAgo(c.lastSync))}</dd>
           <dt>Ждут отправки</dt><dd>${c.pending} ссыл. / ${c.dirty} правок</dd>
-          <dt>Домашние адреса</dt><dd>${esc((c.endpoints.lan || []).join(', ') || '—')}</dd>
-          <dt>Внешний адрес</dt><dd>${esc((c.endpoints.wan || []).join(', ') || 'не настроен на компьютере')}</dd>
         </dl>
-        ${c.lastError && state === 'offline' ? `<p class="small muted" style="margin:0">${esc(c.lastError)}. Рецепты на телефоне доступны, новые ссылки ждут в очереди.</p>` : ''}
-        ${c.authLost ? '<p class="form-error">Компьютер отключил этот телефон. Подключите заново.</p>' : ''}
         <div class="btn-row">
           <button class="btn btn-primary" id="sync-now">${icon('refresh')}Синхронизировать</button>
           <button class="btn" id="install" ${installEvent ? '' : 'hidden'}>${icon('plus')}Установить приложение</button>
-          <a class="btn btn-ghost" href="#/pair?code=">Подключить заново</a>
+          <a class="btn btn-ghost" href="#/pair?again=1">Подключить заново</a>
         </div>
       </section>
-      <div id="pc-panels" class="panel wide"><p class="muted small" style="margin:0">Состояние компьютера загружается…</p></div>
+      <div id="pc-panels" class="panel wide"><p class="muted small" style="margin:0">Состояние компьютера загрузится, когда он будет на связи.</p></div>
     </div>`;
+  const runCheck = async () => {
+    const card = $('#conn-card');
+    if (!card) return;
+    card.innerHTML = connCardHtml(await store.connection(), null, true);
+    const diag = await store.diagnose().catch(() => null);
+    const fresh = await store.connection();
+    if (!$('#conn-card')) return;
+    $('#conn-card').innerHTML = connCardHtml(fresh, diag, false);
+    $('#check-now').addEventListener('click', runCheck);
+    if (diag?.ok) loadPcPanels();
+  };
   $('#sync-now').addEventListener('click', async (e) => {
     e.target.disabled = true;
     const res = await store.sync('manual');
@@ -1176,18 +1480,21 @@ async function renderDeviceSystem() {
     toast(res.ok ? `Готово${res.changed ? `: обновлено ${res.changed}` : ''}` : res.error, 3500);
     renderDeviceSystem();
   });
-  $('#install').addEventListener('click', async () => {
-    if (!installEvent) return;
-    installEvent.prompt();
-    await installEvent.userChoice.catch(() => {});
-    installEvent = null;
-    $('#install').hidden = true;
-  });
+  bindInstallButton();
+  runCheck();
+}
+
+async function loadPcPanels() {
   try {
     const [s, g] = await Promise.all([store.system(), store.chains()]);
     const holder = $('#pc-panels');
     if (!holder) return;
-    holder.outerHTML = systemPanels(s, g);
+    const o = s.ollama;
+    const busy = ACTIVE.reduce((n, k) => n + (s.queue.counts[k] || 0), 0);
+    const ready = o.ok && o.model_installed;
+    holder.outerHTML = `<section class="panel wide"><h3>Обработка ссылок ${ready ? '<span class="ok">работает</span>' : '<span class="bad">не готова</span>'}</h3>
+      <p class="small" style="margin:0">${ready ? (busy ? `Сейчас в работе и в очереди: ${busy}.` : 'Компьютер свободен и готов разбирать новые ссылки.')
+        : 'Модель на компьютере недоступна — ссылки будут ждать в очереди, пока её не запустят.'}</p></section>${systemPanels(s, g)}`;
     bindSystemPanels();
   } catch (e) {
     const holder = $('#pc-panels');
@@ -1201,33 +1508,47 @@ async function renderDeviceSystem() {
 async function renderPhoneSetup() {
   const net = await store.net();
   const lanApp = net.endpoints.lan[0];
-  view.innerHTML = `
-    <div class="topbar"><a class="btn btn-ghost" href="#/system">${icon('back')}Система</a></div>
-    <h1 class="h1" style="margin-bottom:16px">Приложение на телефон</h1>
-    <div class="edit-form">
-      <section class="panel"><h3>1. Сертификат домашнего компьютера</h3>
+  const wanReady = net.endpoints.wan.length > 0 && !!net.acme?.valid_until;
+  const caSteps = `
         <p class="small" style="margin:0">Один раз — чтобы телефон доверял компьютеру. Сертификат подходит только для адресов домашней сети${net.public_host ? ` и ${esc(net.public_host)}` : ''} и не даёт доступа к другим сайтам.</p>
-        <a class="btn btn-primary" href="ca.crt" download style="justify-self:start">Скачать сертификат</a>
+        <a class="btn" href="ca.crt" download style="justify-self:start">Скачать сертификат</a>
         <ol class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">
           <li>Откройте «Настройки → Безопасность → Шифрование и учётные данные → Установка сертификата → Сертификат ЦС» (на Samsung: «Биометрия и безопасность → Другие параметры безопасности → Установить из памяти»).</li>
           <li>Нажмите «Всё равно установить» и выберите скачанный файл recipes-home-ca.crt.</li>
           <li>Android попросит PIN-код экрана — это нормально.</li>
         </ol>
         <p class="small muted" style="margin:0">Отпечаток: ${esc(net.tls?.ca_fingerprint || '')}</p>
+        <p class="small" style="margin:0">Затем откройте приложение по домашнему адресу — оно сразу подключится:</p>
+        <button class="btn" id="open-app" style="justify-self:start" ${lanApp ? '' : 'disabled'}>Открыть приложение по домашнему адресу</button>
+        <p class="form-error" id="open-err" hidden></p>`;
+  view.innerHTML = `
+    <div class="topbar"><a class="btn btn-ghost" href="#/system">${icon('back')}Система</a></div>
+    <h1 class="h1" style="margin-bottom:16px">Приложение на телефон</h1>
+    <div class="edit-form">
+      ${wanReady ? `
+      <section class="panel"><h3>1. Подключение — один QR-код</h3>
+        <p class="small" style="margin:0">Сертификаты ставить не нужно: компьютер доступен по ${esc(shortUrl(net.endpoints.wan[0]))} с сертификатом Let's Encrypt — и дома, и вне дома.</p>
+        ${PAIR_STEPS}
+        <button class="btn btn-primary" id="show-qr" style="justify-self:start">${icon('qr')}Показать QR-код</button>
       </section>
-      <section class="panel"><h3>2. Открыть и подключить приложение</h3>
-        <p class="small" style="margin:0">Телефон должен быть в домашней Wi-Fi сети. Кнопка откроет приложение и сразу подключит его к компьютеру.</p>
-        <button class="btn btn-primary" id="open-app" style="justify-self:start" ${lanApp ? '' : 'disabled'}>Открыть приложение</button>
-        <p class="form-error" id="open-err" hidden></p>
+      <section class="panel"><h3>2. Как отправлять ссылки</h3>
+        <ul class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">
+          <li><b>Android:</b> в YouTube, Instagram или браузере «Поделиться» → «Рецепты». Ссылка встанет в очередь даже без связи с компьютером.</li>
+          <li><b>iPhone:</b> скопируйте ссылку, откройте «Рецепты» → «Добавить» и вставьте её (iPhone не показывает приложения с экрана «Домой» в меню «Поделиться»).</li>
+        </ul>
       </section>
-      <section class="panel"><h3>3. Установить на главный экран</h3>
-        <p class="small" style="margin:0">В открывшемся приложении: меню Chrome «⋮ → Установить приложение» (или кнопка «Установить приложение» в разделе «Связь»). После установки в меню «Поделиться» появится «Рецепты» — так удобнее всего отправлять ссылки из YouTube и Instagram.</p>
+      <details class="panel"><summary><b>Без интернета, только дома (необязательно)</b></summary>
+        <div style="display:grid;gap:10px;margin-top:10px">${caSteps}</div></details>` : `
+      <section class="panel"><h3>Сначала — доступ из интернета</h3>
+        <p class="small" style="margin:0">Проще всего настроить в «Система → Доступ из интернета»: статический IP, проброс порта и сертификат Let's Encrypt. Тогда телефон подключается одним QR-кодом без установки сертификатов.</p>
       </section>
+      <section class="panel"><h3>Или только дома: сертификат компьютера</h3>${caSteps}</section>`}
     </div>`;
-  $('#open-app').addEventListener('click', async () => {
+  $('#show-qr')?.addEventListener('click', showPairDialog);
+  $('#open-app')?.addEventListener('click', async () => {
     try {
       const code = await store.pairCode();
-      location.href = code.app_url + '&name=' + encodeURIComponent('Телефон');
+      location.href = `${lanApp}/#/pair?code=${code.code}&name=${encodeURIComponent('Телефон')}`;
     } catch (e) { $('#open-err').textContent = e.message; $('#open-err').hidden = false; }
   });
 }
@@ -1245,6 +1566,8 @@ async function start() {
     const onSync = async (ev) => {
       const t = ev.data?.type;
       if (t === 'conn' || t === 'outbox' || t === 'synced' || t === 'sync-error') renderConn();
+      // Компьютер снова на связи — сразу досылаем очередь и забираем новое.
+      if (t === 'conn' && isOnline(ev.data.conn?.state) && !ev.data.wasOnline) tick();
       if (t === 'outbox' || t === 'synced') refreshBadge();
       if (t === 'synced' && ev.data.changed) {
         const { path } = parseHash();
@@ -1259,10 +1582,17 @@ async function start() {
       if (document.visibilityState !== 'visible') return;
       await store.sync('tick');
     };
+    // Лёгкая проверка «компьютер отвечает?» каждые 15 секунд, пока приложение на экране.
+    const heartbeat = async () => {
+      if (document.visibilityState === 'visible' && (await store.paired())) await store.check();
+    };
     document.addEventListener('visibilitychange', tick);
     window.addEventListener('online', tick);
+    window.addEventListener('offline', () => store.markNoNetwork());
     setInterval(async () => { if ((await store.activeCount()) > 0) tick(); }, 8000);
+    setInterval(heartbeat, 15000);
     setInterval(tick, 60000);
+    setInterval(renderConn, 30000); // «был на связи N мин назад» стареет
     renderConn();
     tick();
   }

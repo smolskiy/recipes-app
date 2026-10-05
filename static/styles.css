@@ -429,13 +429,34 @@ details.limits ul { margin: 8px 0 0; padding-left: 18px; }
 @media (min-width: 900px) { .toast { bottom: 24px; } }
 
 /* ---------- Связь с компьютером (режим телефона) ---------- */
+/* Строка состояния над меню видна всегда: зелёная точка — компьютер отвечает, жёлтая — нет. */
 .conn {
   position: fixed; z-index: 19; left: 0; right: 0; bottom: calc(var(--nav-h) + env(safe-area-inset-bottom));
-  padding: 7px 16px; border: 0; text-align: center; font-size: var(--s-12); font-weight: 600; cursor: pointer;
-  background: var(--butter-soft); color: var(--ink); border-top: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 30px; padding: 5px 16px;
+  border: 0; border-top: 1px solid var(--line); cursor: pointer; font-size: var(--s-12); font-weight: 600; color: var(--ink-2);
+  background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
 }
-.conn[data-state="unpaired"] { background: var(--tomato-soft); }
-@media (min-width: 900px) { .conn { left: 232px; bottom: 0; } }
+.conn span, .conn small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conn small { font-size: inherit; font-weight: 500; color: var(--ink-3); flex-shrink: 1; }
+.conn small::before { content: "· "; }
+.conn[data-state="offline"] { background: var(--butter-soft); color: var(--ink); }
+.conn[data-state="unpaired"], .conn[data-state="auth"] { background: var(--tomato-soft); color: var(--ink); }
+body[data-route="pair"] .conn { display: none; }
+body.has-conn .view { padding-bottom: calc(var(--nav-h) + 64px + env(safe-area-inset-bottom)); }
+body.has-conn .toast { bottom: calc(var(--nav-h) + 46px + env(safe-area-inset-bottom)); }
+body.has-conn .sticky-actions { bottom: calc(var(--nav-h) + 38px + env(safe-area-inset-bottom)); }
+@media (min-width: 900px) {
+  .conn { left: 232px; bottom: 0; }
+  body.has-conn .view { padding-bottom: 80px; }
+  body.has-conn .toast { bottom: 46px; }
+  body.has-conn .sticky-actions { bottom: 46px; }
+}
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3); flex: none; }
+.dot.big { width: 14px; height: 14px; }
+[data-state="lan"] > .dot, [data-state="wan"] > .dot { background: var(--dill); box-shadow: 0 0 0 3px var(--dill-soft); }
+[data-state="offline"] > .dot { background: var(--butter); box-shadow: 0 0 0 3px color-mix(in srgb, var(--butter) 25%, transparent); }
+[data-state="unpaired"] > .dot, [data-state="auth"] > .dot { background: var(--tomato); }
+[data-state="unknown"] > .dot { background: var(--cobalt); animation: pulse 1.2s ease-in-out infinite; }
 .nav-item[data-conn] { position: relative; }
 .nav-item[data-conn]::after {
   content: ""; position: absolute; top: 6px; left: calc(50% + 8px); width: 9px; height: 9px; border-radius: 50%;
@@ -445,6 +466,46 @@ details.limits ul { margin: 8px 0 0; padding-left: 18px; }
 .nav-item[data-conn="offline"]::after { background: var(--butter); }
 .nav-item[data-conn="unpaired"]::after { background: var(--tomato); }
 @media (min-width: 900px) { .nav-item[data-conn]::after { top: 50%; left: auto; right: 14px; transform: translateY(-50%); } }
+
+.conn-head { display: flex; align-items: center; gap: 14px; }
+.conn-head b { display: block; font-family: var(--f-display); font-size: var(--s-18); line-height: 1.2; }
+.conn-head small { display: block; color: var(--ink-3); font-size: var(--s-14); margin-top: 3px; }
+.diag { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: var(--s-14); }
+.diag li { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px; align-items: center; padding: 9px 12px; border-radius: 10px; background: var(--surface-2); }
+.diag li svg { width: 18px; height: 18px; }
+.diag li.is-ok svg { color: var(--dill); }
+.diag li.is-bad svg { color: var(--butter); }
+.diag li.is-idle { background: none; border: 1px dashed var(--line); color: var(--ink-3); }
+.diag li.is-idle svg, .diag li.is-idle em { color: var(--ink-3); }
+.devlist { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; font-size: var(--s-14); }
+.devlist li { padding: 10px 12px; background: var(--surface-2); border-radius: 10px; }
+.diag small { color: var(--ink-3); word-break: break-all; }
+.diag em { font-style: normal; color: var(--ink-2); text-align: right; }
+@media (max-width: 560px) { .diag li { grid-template-columns: auto 1fr; } .diag em { grid-column: 2; text-align: left; } }
+
+/* ---------- Подключение телефона ---------- */
+.pair-hero { gap: 12px; }
+.btn-big { min-height: 56px; padding: 0 24px; font-size: var(--s-16); justify-self: start; border-radius: 16px; }
+.btn-big svg { width: 22px; height: 22px; }
+details.panel > summary, details.manual > summary { cursor: pointer; font-weight: 600; }
+.code-input { letter-spacing: .12em; text-transform: uppercase; font-weight: 700; }
+.steps-list { margin: 0; padding-left: 22px; display: grid; gap: 8px; }
+.steps-list li::marker { font-weight: 700; color: var(--cobalt); }
+.inline-ico { width: 18px; height: 18px; vertical-align: -3px; color: var(--cobalt); }
+.pair-wait { justify-items: center; text-align: center; padding: 36px 16px; }
+.pair-wait p { margin: 0; color: var(--ink-2); }
+.pair-done { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: start; background: var(--dill-soft); border-radius: var(--r-card); padding: 16px; }
+.pair-done > svg { color: var(--dill); width: 28px; height: 28px; }
+.pair-done b { display: block; margin-bottom: 2px; }
+.pair-qr { width: min(260px, 68vw); height: auto; aspect-ratio: 1; justify-self: center; border-radius: 14px; background: #fff; padding: 8px; }
+.code-big { font-family: var(--f-display); letter-spacing: .12em; font-size: var(--s-18); color: var(--cobalt); }
+.wait-line { display: flex; align-items: center; gap: 8px; margin: 0; }
+.spinner { width: 30px; height: 30px; border-radius: 50%; border: 3px solid var(--cobalt-soft); border-top-color: var(--cobalt); animation: spin .9s linear infinite; }
+.spinner.small { width: 14px; height: 14px; border-width: 2px; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.scan-box { position: relative; border-radius: 14px; overflow: hidden; background: #000; aspect-ratio: 1; }
+.scan-box video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.scan-frame { position: absolute; inset: 14%; border: 3px solid rgba(255, 255, 255, .92); border-radius: 18px; box-shadow: 0 0 0 999px rgba(0, 0, 0, .28); }
 .thumb.noimg img, .hero-img.noimg { display: none; }
 
 .skeleton { background: var(--surface-2); border-radius: var(--r-card); height: 104px; }

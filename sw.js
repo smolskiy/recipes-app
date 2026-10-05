@@ -5,7 +5,7 @@
 
 import { enqueue, extractUrl, syncAll } from './static/sync-core.js';
 
-const VERSION = 'b2222f99a541';
+const VERSION = 'e0cb3a428866';
 const CACHE = `recipes-shell-${VERSION}`;
 const SHELL = [
   './', 'manifest.webmanifest',
@@ -54,6 +54,7 @@ self.addEventListener('fetch', (event) => {
   if (rel === null) return;
   if (rel === 'share-target') { event.respondWith(handleShare(url)); return; }
   if (rel.startsWith('api/') || rel.startsWith('images/') || rel === 'ca.crt') return; // данные — только из сети
+  if (url.searchParams.has('netcheck')) return; // проверка интернета на телефоне — мимо кэша
   if (req.mode === 'navigate') {
     event.respondWith((async () => {
       const cached = await caches.match(scopeUrl('./'));

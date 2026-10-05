@@ -80,15 +80,18 @@ async function candidates() {
   return list;
 }
 
-// Порядок групп: приложение с ПК или APK — сначала дом; приложение с GitHub Pages — сначала интернет
-// (домашний адрес с публичной страницы вызывает запрос разрешения на доступ к локальной сети).
+// Порядок групп: приложение с ПК или APK — сначала дом; приложение с GitHub Pages — только интернет.
+// Домашний адрес с публичной страницы работает лишь с установленным на телефон сертификатом ПК и вызывает
+// запрос «доступ к устройствам в локальной сети», поэтому его пробуем, только если внешнего адреса нет
+// или домашний уже однажды сработал.
 async function groups(list) {
   const lanFirst = NATIVE || (await kv.get('originIsPc', false));
   const last = await kv.get('lastEndpoint');
-  const lan = list.filter((e) => e.kind === 'lan');
+  let lan = list.filter((e) => e.kind === 'lan');
   const wan = list.filter((e) => e.kind === 'wan');
+  if (!lanFirst && wan.length && !(await kv.get('lanOk', false))) lan = [];
   const out = [];
-  if (last) out.push(list.filter((e) => e.url === last.url));
+  if (last) out.push(list.filter((e) => e.url === last.url && (e.kind === 'wan' || lan.includes(e))));
   out.push(...(lanFirst ? [lan, wan] : [wan, lan]));
   return out.filter((g) => g.length);
 }
@@ -101,13 +104,22 @@ async function probe(ep, token, ms = 3500) {
   });
   if (r.status === 401) throw new AuthError('Телефон отключён на компьютере. Подключите его заново.');
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (ep.kind === 'lan') await kv.set('lanOk', true);
   return ep;
 }
+
+// Адрес ПК считается рабочим 20 секунд, дальше — новая проверка (иначе выключенный ПК долго выглядит «на связи»).
+const FRESH_MS = 20000;
 
 export async function connect(force = false) {
   const token = await kv.get('token');
   if (!token) throw new AuthError('Приложение ещё не подключено к компьютеру');
-  if (!force && current && Date.now() - current.at < 60000) return current;
+  if (!force && current && Date.now() - current.at < FRESH_MS) return current;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    current = null;
+    await setConn({ state: 'offline', reason: 'nonet' });
+    throw new OfflineError('Нет интернета на телефоне');
+  }
   const list = await candidates();
   let found = null;
   let authErr = null;
@@ -119,7 +131,8 @@ export async function connect(force = false) {
   }
   if (!found) {
     current = null;
-    await setConn({ state: 'offline', tried: list.map((e) => e.url) });
+    if (authErr && !(await kv.get('authLost', false))) { await kv.set('authLost', true); emit('auth'); }
+    await setConn({ state: 'offline', reason: authErr ? 'auth' : 'pc', tried: list.map((e) => e.url) });
     if (authErr) throw authErr;
     throw new OfflineError('Нет связи с домашним компьютером');
   }
@@ -132,8 +145,55 @@ export async function connect(force = false) {
 async function setConn(conn) {
   conn.at = new Date().toISOString();
   if (conn.state !== 'offline') await kv.set('lastOnline', conn.at);
+  const prev = await kv.get('conn');
   await kv.set('conn', conn);
-  emit('conn', { conn });
+  emit('conn', { conn, wasOnline: prev?.state === 'lan' || prev?.state === 'wan' });
+}
+
+// Телефон сообщил, что сеть пропала, — показываем это сразу, не дожидаясь проверки.
+export async function markNoNetwork() {
+  current = null;
+  if (await kv.get('token')) await setConn({ state: 'offline', reason: 'nonet' });
+}
+
+// Подробная проверка для экрана «Связь»: все адреса ПК параллельно, со временем ответа и причиной ошибки,
+// плюс есть ли вообще интернет на телефоне (для приложения с GitHub Pages).
+export async function diagnose() {
+  const token = await kv.get('token');
+  const list = await candidates();
+  const lanFirst = NATIVE || (await kv.get('originIsPc', false));
+  const lanUsed = lanFirst || !list.some((e) => e.kind === 'wan') || (await kv.get('lanOk', false));
+  const check = async (ep) => {
+    const t0 = performance.now();
+    try {
+      await probe(ep, token, 6000);
+      return { ...ep, ok: true, ms: Math.round(performance.now() - t0) };
+    } catch (e) {
+      const timeout = e.name === 'TimeoutError' || e.name === 'AbortError';
+      return { ...ep, ok: false, auth: e instanceof AuthError, error: e instanceof AuthError ? e.message : timeout ? 'нет ответа' : 'не удалось соединиться' };
+    }
+  };
+  const net = (async () => {
+    if (NATIVE || lanFirst) return null;
+    try {
+      const r = await fetch(`manifest.webmanifest?netcheck=${Date.now()}`, { cache: 'no-store', signal: AbortSignal.timeout(6000) });
+      return r.ok;
+    } catch { return false; }
+  })();
+  const items = await Promise.all(list.filter((e) => e.kind === 'wan' || lanUsed).map(check));
+  const internet = await net;
+  const ok = items.find((i) => i.ok);
+  if (ok) {
+    current = { url: ok.url, kind: ok.kind, at: Date.now() };
+    await kv.set('lastEndpoint', { url: ok.url, kind: ok.kind });
+    await setConn({ state: ok.kind, endpoint: ok.url });
+  } else if (token) {
+    current = null;
+    const auth = items.some((i) => i.auth);
+    if (auth && !(await kv.get('authLost', false))) { await kv.set('authLost', true); emit('auth'); }
+    await setConn({ state: 'offline', reason: auth ? 'auth' : internet === false ? 'nonet' : 'pc', tried: items.map((i) => i.url) });
+  }
+  return { items, internet, ok: !!ok, skippedLan: !lanUsed };
 }
 
 export async function api(path, { method = 'GET', body, timeout = 25000, raw = false } = {}) {
@@ -171,17 +231,33 @@ export async function api(path, { method = 'GET', body, timeout = 25000, raw = f
 }
 
 // ---------- Привязка ----------
+export function normalizePcUrl(raw) {
+  let url = (raw || '').trim().replace(/\/+$/, '').replace(/\/#.*$/, '');
+  if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+  return url;
+}
+
 export async function pair(baseUrl, code, name) {
-  const res = await fetch(baseUrl.replace(/\/+$/, '') + '/api/device/pair', {
+  baseUrl = normalizePcUrl(baseUrl);
+  code = (code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const res = await fetch(baseUrl + '/api/device/pair', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000),
     body: JSON.stringify({ code, name }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.detail || `Ошибка привязки (${res.status})`);
+  // Подключение заново: прежний ключ этого телефона отзываем, чтобы на ПК не копились старые записи.
+  const oldToken = await kv.get('token');
+  if (oldToken && oldToken !== data.token) {
+    fetch(baseUrl + '/api/device/unpair', { method: 'POST', headers: { Authorization: `Bearer ${oldToken}` }, signal: AbortSignal.timeout(8000) })
+      .catch(() => {});
+  }
   await kv.set('token', data.token);
   await kv.set('device', data.device);
   await kv.set('endpoints', data.endpoints);
-  await kv.set('lastEndpoint', { url: baseUrl.replace(/\/+$/, ''), kind: isPrivateHost(new URL(baseUrl).hostname) ? 'lan' : 'wan' });
+  const kind = isPrivateHost(new URL(baseUrl).hostname) ? 'lan' : 'wan';
+  await kv.set('lastEndpoint', { url: baseUrl, kind });
+  if (kind === 'lan') await kv.set('lanOk', true);
   await kv.del('authLost');
   current = null;
   return data;
