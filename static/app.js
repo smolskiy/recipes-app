@@ -244,7 +244,8 @@ const listStates = {
 };
 let listData = null; // { collection, items } — все карточки открытого раздела
 let lastListHash = '#/'; // куда возвращаться со страницы рецепта
-let listIO = null;
+let listIOs = []; // подгрузка карточек: по одной на каждый список на странице
+const stopCards = () => { listIOs.forEach((io) => io.disconnect()); listIOs = []; };
 const PAGE = 48;
 
 async function renderList(params, collection = 'mine', seq = navSeq) {
@@ -298,7 +299,7 @@ async function renderList(params, collection = 'mine', seq = navSeq) {
   });
   $('#author')?.addEventListener('change', (e) => { st.author = e.target.value; drawList(); });
   $('#sort').addEventListener('change', (e) => { st.sort = e.target.value; writePref(`sort.${collection}`, st.sort); drawList(); });
-  currentCleanup = () => { listIO?.disconnect(); listIO = null; listData = null; };
+  currentCleanup = () => { stopCards(); listData = null; };
   const data = await store.listRecipes({ collection });
   if (isStale(seq)) return;
   listData = { collection, items: data.items };
@@ -350,7 +351,7 @@ function drawList() {
   list = sortItems(list, st.sort);
   $('#count').textContent = list.length ? `${list.length} ${plural(list.length, ['рецепт', 'рецепта', 'рецептов'])}` : '';
   const box = $('#results');
-  listIO?.disconnect();
+  stopCards();
   if (!list.length) {
     const filtered = st.q || anyFilter || st.author;
     box.innerHTML = filtered
@@ -381,8 +382,7 @@ function renderCards(box, list, render) {
   btn.addEventListener('click', more);
   const io = new IntersectionObserver((en) => { if (en.some((e) => e.isIntersecting) && !btn.hidden) more(); }, { rootMargin: '800px' });
   io.observe(btn);
-  listIO?.disconnect();
-  listIO = io;
+  listIOs.push(io);
   more();
 }
 
@@ -461,13 +461,15 @@ async function renderPantry(seq = navSeq) {
     { staples: pantry.staples, ignoreSpices: pantry.ignoreSpices });
   if (!pantryUi.tab) pantryUi.tab = pantry.items.size ? 'dishes' : 'products';
   view.innerHTML = `
+    <div id="pantry-page">
     <header class="page-head"><h1 class="h1">Есть дома</h1></header>
     <p class="lead pantry-lead">Отметьте продукты, которые есть, — приложение подберёт блюда из ваших рецептов и рецептов каналов.</p>
     <div class="seg pantry-tabs" role="group" aria-label="Раздел">
       <button type="button" data-tab="products">${icon('basket')}Продукты <span class="n" id="n-prod"></span></button>
       <button type="button" data-tab="dishes">${icon('book')}Блюда <span class="n" id="n-dish"></span></button>
     </div>
-    <div id="pbody"></div>`;
+    <div id="pbody"></div>
+    </div>`;
   const counts = () => {
     $('#n-prod').textContent = pantry.items.size || '';
     $('#n-dish').textContent = pantry.items.size ? matches().length : '';
@@ -558,15 +560,16 @@ async function renderPantry(seq = navSeq) {
 
   const drawTab = () => {
     $$('.pantry-tabs button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.tab === pantryUi.tab));
-    listIO?.disconnect();
+    stopCards();
     if (pantryUi.tab === 'products') drawProducts(); else drawDishes();
     counts();
   };
 
-  view.addEventListener('click', onPantryClick);
+  const root = $('#pantry-page');
+  root.addEventListener('click', onPantryClick);
   function onPantryClick(e) {
     const t = e.target.closest('[data-tab], [data-k], [data-s], [data-more], [data-scope]');
-    if (!t || !view.contains(t)) return;
+    if (!t || !root.contains(t)) return;
     if (t.dataset.tab) { pantryUi.tab = t.dataset.tab; drawTab(); return; }
     if (t.dataset.more) { pantryUi.open.add(t.dataset.more); drawGroups(); return; }
     if (t.dataset.scope) { pantryUi.scope = t.dataset.scope; drawDishes(); counts(); return; }
@@ -581,7 +584,7 @@ async function renderPantry(seq = navSeq) {
     if (pantry.items.has(k)) pantry.items.delete(k); else pantry.items.add(k);
     save(); drawHave(); drawGroups(); counts();
   }
-  currentCleanup = () => { view.removeEventListener('click', onPantryClick); listIO?.disconnect(); listIO = null; };
+  currentCleanup = stopCards;
   drawTab();
 }
 
@@ -694,9 +697,9 @@ async function renderChannels(seq = navSeq) {
       load();
     } catch (ex) { err.textContent = ex.message; err.hidden = false; }
   });
-  await load();
   const timer = setInterval(load, 5000);
   currentCleanup = () => clearInterval(timer);
+  await load();
 }
 
 // =====================================================================

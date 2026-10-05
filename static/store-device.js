@@ -32,7 +32,8 @@ let recipesCache = null;
 function invalidate() { recipesCache = null; }
 function onSyncMessage(ev) {
   const t = ev.data?.type;
-  if (t === 'synced' && ev.data.changed) invalidate();
+  // Любая синхронизация (и прерванная тоже: часть рецептов уже могла записаться) — читаем рецепты заново.
+  if (t === 'synced' || t === 'sync-error') invalidate();
   if (t === 'synced') imgPending.clear(); // неудачные картинки — ещё раз после новой синхронизации
 }
 core.events.addEventListener('message', onSyncMessage);
@@ -173,7 +174,9 @@ export const deviceStore = {
   addChannel: (url, limit) => online(() => core.api('/api/channels', { method: 'POST', body: { url, limit } })),
   channelAction: (id, action) => online(() => core.api(`/api/channels/${id}/${action}`, { method: 'POST' })),
   deleteChannel: (id) => online(() => core.api(`/api/channels/${id}`, { method: 'DELETE', timeout: 60000 })),
-  renameChannel: (id, title) => online(() => core.api(`/api/channels/${id}/rename`, { method: 'POST', body: { title }, timeout: 60000 })),
+  // Новое название рецептов канала — сразу на телефон, до следующих правок.
+  renameChannel: (id, title) => online(() => core.api(`/api/channels/${id}/rename`, { method: 'POST', body: { title }, timeout: 60000 }))
+    .then((res) => { core.syncAll('rename'); return res; }),
   reprocess: (key) => online(() => core.api(`/api/device/recipes/${key}/reprocess`, { method: 'POST' })),
   async addJob(body) {
     const item = await core.enqueue(body);

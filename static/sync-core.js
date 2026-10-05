@@ -364,13 +364,27 @@ async function pushChanges() {
   const items = dirty.map((r) => ({ uid: r.uid, deleted: !!r._deleted, updated_at: r.updated_at, recipe: r._deleted ? null : toRecipeIn(r) }));
   const res = await api('/api/device/push', { method: 'POST', body: { items }, timeout: 60000 });
   let stale = false;
-  for (const r of dirty) {
+  for (const [i, r] of dirty.entries()) {
     const status = res.results[r.uid];
+    const pushedSaved = items[i].recipe?.saved;
+    // Пока шла отправка, рецепт могли изменить ещё раз (сердечко сразу после «Сохранить к себе») —
+    // такую правку не затираем снимком: она уйдёт следующей отправкой.
+    const cur = await dbGet('recipes', r.uid);
+    const changedMeanwhile = cur && cur.updated_at !== r.updated_at;
     if (status === 'applied' || status === 'missing') {
+      if (changedMeanwhile) {
+        if (pushedSaved != null) { cur._saved0 = pushedSaved; await dbPut('recipes', cur); }
+        continue;
+      }
       if (r._deleted) await dbDel('recipes', r.uid);
-      else { delete r._dirty; await dbPut('recipes', r); }
+      else {
+        delete r._dirty;
+        if (pushedSaved != null) r._saved0 = pushedSaved;
+        await dbPut('recipes', r);
+      }
     } else if (status === 'stale') {
       stale = true; // на ПК правка новее — заберём её полной синхронизацией
+      if (changedMeanwhile) continue;
       delete r._dirty;
       if (r._deleted) delete r._deleted;
       await dbPut('recipes', r);
@@ -387,6 +401,9 @@ export function toRecipeIn(r) {
   for (const f of RECIPE_FIELDS) out[f] = r[f] ?? (Array.isArray(r[f]) ? [] : null);
   for (const f of ['ingredients', 'steps', 'tips', 'categories', 'tags', 'issues']) out[f] = out[f] || [];
   out.needs_review = !!out.needs_review; out.favorite = !!out.favorite;
+  // «Сохранить к себе» отправляем, только если его поменяли на телефоне (с последней синхронизации):
+  // иначе старая копия на телефоне отменила бы сохранение, сделанное на компьютере.
+  out.saved = r.saved != null && !!r.saved !== !!r._saved0 ? !!r.saved : null;
   return out;
 }
 
@@ -410,7 +427,7 @@ async function pullChanges() {
         if (local) { await dbDel('recipes', item.uid); changed++; }
         continue;
       }
-      const rec = { ...item.recipe, uid: item.uid, seq: item.seq, updated_at: item.updated_at };
+      const rec = { ...item.recipe, uid: item.uid, seq: item.seq, updated_at: item.updated_at, _saved0: !!item.recipe.saved };
       if (local?._source) rec._source = local._source;
       puts.push(rec);
     }
@@ -459,8 +476,13 @@ async function refreshEndpoints() {
 
 // ---------- Полная синхронизация ----------
 let running = null;
+let again = false; // правка во время синхронизации — отправим её сразу следующей
+let imagesRunning = false;
 export function syncAll(reason = '') {
-  if (running) return running;
+  if (running) {
+    if (reason === 'change') again = true;
+    return running;
+  }
   running = (async () => {
     try {
       // Проверка ключа — внутри try: иначе finally не сбросит running, и после подключения
@@ -475,7 +497,11 @@ export function syncAll(reason = '') {
       await kv.set('lastSync', new Date().toISOString());
       await kv.del('lastSyncError');
       emit('synced', { changed, reason });
-      await fetchMissingImages().catch(() => {}); // картинки — не повод считать синхронизацию неудачной
+      if (!imagesRunning) {
+        // Картинки — отдельно и не дольше 20 секунд: синхронизация правок их не ждёт.
+        imagesRunning = true;
+        fetchMissingImages().catch(() => {}).finally(() => { imagesRunning = false; });
+      }
       return { ok: true, changed };
     } catch (e) {
       await kv.set('lastSyncError', e.message);
@@ -483,6 +509,7 @@ export function syncAll(reason = '') {
       return { ok: false, error: e.message, offline: e instanceof OfflineError };
     } finally {
       running = null;
+      if (again) { again = false; syncAll('change'); }
     }
   })();
   return running;
