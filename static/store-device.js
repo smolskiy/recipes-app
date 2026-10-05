@@ -53,7 +53,7 @@ function jobView(it) {
   const job = it.job || {};
   const status = it.state === 'pending' ? 'pending' : it.state === 'duplicate' ? 'duplicate' : it.state === 'rejected' ? 'rejected' : job.status || 'queued';
   return {
-    key: it.cid, kind: it.text ? 'text' : 'url', url: it.url, title: job.title || null, status,
+    key: it.cid, kind: it.text ? 'text' : 'url', url: it.url, title: job.title || null, status, source_kind: job.source_kind || null,
     status_label: STATUS_LABELS[status] || job.status_label || status,
     stage_detail: it.state === 'pending' ? (it.error || 'Отправится, как только телефон увидит компьютер') : job.stage_detail,
     error: it.state === 'duplicate' ? it.error : (it.state === 'rejected' ? it.error : job.error),
@@ -193,6 +193,7 @@ export const deviceStore = {
   setStore: (store) => online(() => core.api('/api/grocery/store', { method: 'POST', body: store })),
   groceryCheck: (chain) => online(() => core.api(`/api/grocery/check?chain=${chain}`, { timeout: 60000 })),
   grocerySearch: (chain, q) => online(() => core.api(`/api/grocery/search?chain=${chain}&q=${encodeURIComponent(q)}`, { timeout: 60000 })),
+  refreshCatalog: (chain) => online(() => core.api(`/api/grocery/catalog/${chain}/refresh`, { method: 'POST' })),
   geocode: (query) => online(() => core.api('/api/grocery/geocode', { method: 'POST', body: { query } })),
   setLocation: (loc) => online(() => core.api('/api/grocery/location', { method: 'POST', body: loc, timeout: 120000 })),
   async limits() {

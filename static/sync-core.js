@@ -419,9 +419,10 @@ let running = null;
 export function syncAll(reason = '') {
   if (running) return running;
   running = (async () => {
-    const token = await kv.get('token');
-    if (!token) return { ok: false, state: 'unpaired' };
     try {
+      // Проверка ключа — внутри try: иначе finally не сбросит running, и после подключения
+      // телефона синхронизация так и возвращала бы «не подключено» до перезапуска приложения.
+      if (!(await kv.get('token'))) return { ok: false, state: 'unpaired' };
       await connect();
       await sendOutbox();
       await pushChanges();

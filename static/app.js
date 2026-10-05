@@ -100,7 +100,11 @@ function parseHash() {
 }
 async function setImg(img, name) {
   const url = await store.imageUrl(name);
-  if (url) img.src = url; else img.closest('.thumb, .hero-img')?.classList.add('noimg');
+  if (url) {
+    img.onload = () => img.closest('.dish, .hero-img')?.classList.add('loaded');
+    img.onerror = () => img.closest('.dish, .hero-img')?.classList.add('noimg');
+    img.src = url;
+  } else img.closest('.dish, .hero-img')?.classList.add('noimg');
 }
 function hydrateImages(root = view) {
   $$('img[data-img]', root).forEach((img) => setImg(img, img.dataset.img));
@@ -178,6 +182,7 @@ async function renderConn() {
 // ---------- Маршрутизация ----------
 let currentCleanup = null;
 async function route() {
+  closeCook?.();
   currentCleanup?.();
   currentCleanup = null;
   const { path, params } = parseHash();
@@ -212,7 +217,7 @@ async function renderList(params) {
   listState.q = params.get('q') || listState.q;
   view.innerHTML = `
     <header class="page-head">
-      <h1 class="h1">Наши рецепты</h1>
+      <h1 class="h1">Что готовим?</h1>
       <span class="count" id="count"></span>
     </header>
     <label class="search">${icon('search')}
@@ -257,27 +262,34 @@ async function loadList() {
   if (!data.items.length) {
     box.innerHTML = (listState.q || anyFilter)
       ? `<div class="empty"><p>Ничего не нашлось. Попробуйте другое слово или сбросьте фильтры.</p></div>`
-      : `<div class="empty"><div class="plate"></div><p>Здесь пока пусто. Добавьте ссылку на рецепт с сайта, YouTube или Instagram — он появится тут в едином виде.</p><a class="btn btn-primary" href="#/add">${icon('plus')}Добавить рецепт</a></div>`;
+      : `<div class="empty"><span class="plate" aria-hidden="true"><i></i></span><p>Здесь пока пусто. Добавьте ссылку на рецепт с сайта, YouTube или Instagram — он появится тут в едином виде.</p><a class="btn btn-primary" href="#/add">${icon('plus')}Добавить рецепт</a></div>`;
     return;
   }
   box.innerHTML = `<div class="list">${data.items.map(cardHtml).join('')}</div>`;
   hydrateImages(box);
 }
 
+// Тарелка вместо фото: белая эмаль с кобальтовой каймой, в центре — первая буква; фон — по категории.
+const CAT_TINT = { 'Выпечка': 'butter', 'Десерты': 'butter', 'Завтраки': 'butter', 'Супы': 'tomato', 'Основные блюда': 'tomato',
+  'Салаты': 'dill', 'Закуски': 'dill', 'Гарниры': 'dill', 'Напитки': 'cobalt', 'Соусы': 'cobalt' };
+function plateHtml(r, big = false) {
+  const letter = (r.title || '?').trim()[0]?.toUpperCase() || '?';
+  const tint = CAT_TINT[(r.categories || [])[0]] || 'cobalt';
+  return `<span class="plate ${big ? 'big' : ''}" data-tint="${tint}" aria-hidden="true"><i>${esc(letter)}</i></span>`;
+}
+
 function cardHtml(r) {
   const time = fmtMin(r.total_time_min);
-  const thumb = r.image
-    ? `<img data-img="${esc(r.image)}" alt="" loading="lazy">`
-    : `<span class="mono">${esc((r.title || '?').trim()[0]?.toUpperCase() || '?')}</span>`;
   const meta = [];
   if (time) meta.push(`<span>${icon('clock')}${esc(time)}</span>`);
   if (r.servings) meta.push(`<span>${icon('people')}${esc(fmtAmount(r.servings))}</span>`);
-  if (r.needs_review) meta.push(`<span class="flag">${icon('warn')}уточнить</span>`);
-  else if (r.source_name) meta.push(`<span>${esc(r.source_name.split(',')[0])}</span>`);
+  if (!meta.length && r.source_name) meta.push(`<span>${esc(r.source_name.split(',')[0])}</span>`);
   return `<a class="card" href="#/r/${esc(r.key)}">
-    <div class="thumb">${thumb}</div>
-    <div><p class="card-title">${esc(r.title)}</p><div class="meta">${meta.join('')}</div></div>
-    ${r.favorite ? `<span class="fav" title="В избранном">${icon('heart-fill')}</span>` : ''}
+    <div class="dish">${plateHtml(r)}${r.image ? `<img data-img="${esc(r.image)}" alt="" loading="lazy">` : ''}
+      ${r.favorite ? `<span class="fav" title="В избранном">${icon('heart-fill')}</span>` : ''}
+      ${r.needs_review ? `<span class="review-dot" title="Нужно уточнить">${icon('warn')}</span>` : ''}</div>
+    <p class="card-title">${esc(r.title)}</p>
+    ${meta.length ? `<div class="meta">${meta.join('')}</div>` : ''}
   </a>`;
 }
 
@@ -285,37 +297,43 @@ function cardHtml(r) {
 // Рецепт
 // =====================================================================
 async function renderRecipe(key) {
-  const { recipe: r, job } = await store.getRecipe(key);
+  const { recipe: r } = await store.getRecipe(key);
   let scale = 1;
   const baseServ = r.servings;
+  const checked = new Set(); // отмеченные ингредиенты — общие для страницы и режима готовки
 
-  const times = [];
-  if (r.prep_time_min) times.push(`подготовка ${fmtMin(r.prep_time_min)}`);
-  if (r.cook_time_min) times.push(`готовка ${fmtMin(r.cook_time_min)}`);
   const total = r.total_time_min || ((r.prep_time_min || 0) + (r.cook_time_min || 0)) || null;
   const issues = r.issues || [];
+  const steps = r.steps || [];
+  const ingredients = r.ingredients || [];
+  const facts = [];
+  const timeLabel = r.prep_time_min && r.cook_time_min ? 'всего' : r.cook_time_min ? 'готовка' : r.prep_time_min ? 'подготовка' : 'всего';
+  if (total) facts.push(`<div><b>${esc(fmtMin(total))}</b><span>${timeLabel}</span></div>`);
+  if (baseServ) facts.push(`<div><b id="fact-serv">${esc(fmtAmount(baseServ))}</b><span>${esc(plural(Math.round(baseServ), ['порция', 'порции', 'порций']))}</span></div>`);
+  if (ingredients.length) facts.push(`<div><b>${ingredients.length}</b><span>${plural(ingredients.length, ['ингредиент', 'ингредиента', 'ингредиентов'])}</span></div>`);
+  if (!total && steps.length) facts.push(`<div><b>${steps.length}</b><span>${plural(steps.length, ['шаг', 'шага', 'шагов'])}</span></div>`);
+  const source = r.source_url
+    ? `<a class="source-link" href="${esc(r.source_url)}" target="_blank" rel="noopener noreferrer">${icon(r.source_kind && r.source_kind !== 'web' ? 'play' : 'link')}${esc(r.source_name || hostOf(r.source_url))}</a>`
+    : (r.source_name ? `<span class="source-link">${esc(r.source_name)}</span>` : '');
 
   view.innerHTML = `
-    <div class="topbar">
-      <a class="btn btn-ghost" href="#/">${icon('back')}Рецепты</a>
-      <div class="btn-row">
-        <button class="btn btn-icon" id="fav" aria-pressed="${!!r.favorite}" title="${r.favorite ? 'Убрать из избранного' : 'В избранное'}">${icon(r.favorite ? 'heart-fill' : 'heart')}</button>
-        <a class="btn btn-icon" href="#/r/${esc(r.key)}/edit" title="Изменить">${icon('edit')}</a>
-        <button class="btn btn-icon" id="more" title="Ещё">${icon('more')}</button>
+    <div class="recipe-top">
+      <a class="round-btn" href="#/" aria-label="К рецептам">${icon('back')}</a>
+      <div class="recipe-actions">
+        <button class="round-btn" id="fav" aria-pressed="${!!r.favorite}" aria-label="${r.favorite ? 'Убрать из избранного' : 'В избранное'}">${icon(r.favorite ? 'heart-fill' : 'heart')}</button>
+        <a class="round-btn" href="#/r/${esc(r.key)}/edit" aria-label="Изменить">${icon('edit')}</a>
+        <button class="round-btn" id="more" aria-label="Ещё">${icon('more')}</button>
       </div>
     </div>
-    <section class="recipe-hero ${r.image ? 'has-img' : ''}">
-      ${r.image ? `<div class="hero-img"><img data-img="${esc(r.image)}" alt=""></div>` : ''}
+    <section class="recipe-hero ${r.image ? 'has-img' : 'no-img'}">
+      <div class="hero-img">${plateHtml(r, true)}${r.image ? `<img data-img="${esc(r.image)}" alt="">` : ''}</div>
       <div class="hero-text">
-        <h1 class="h1">${esc(r.title)}</h1>
+        <h1 class="recipe-title">${esc(r.title)}</h1>
         ${r.description ? `<p class="lead">${esc(r.description)}</p>` : ''}
-        <div class="meta">
-          ${total ? `<span>${icon('clock')}${esc(fmtMin(total))}${times.length ? ` <span class="muted">(${esc(times.join(', '))})</span>` : ''}</span>` : ''}
-          ${servingsText(r) ? `<span>${icon('people')}${esc(servingsText(r))}</span>` : ''}
-        </div>
-        ${r.source_url ? `<a class="source-link" href="${esc(r.source_url)}" target="_blank" rel="noopener noreferrer">${icon(r.source_kind && r.source_kind !== 'web' ? 'play' : 'link')}${esc(r.source_name || hostOf(r.source_url))}</a>` : (r.source_name ? `<span class="muted small">${esc(r.source_name)}</span>` : '')}
-        ${r.author && !(r.source_name || '').includes(r.author) ? `<span class="muted small">Автор: ${esc(r.author)}</span>` : ''}
-        <div class="tags">${(r.categories || []).map((c) => `<span class="tag cat">${esc(c)}</span>`).join('')}${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</div>
+        ${source || r.author ? `<p class="byline">${source}${r.author && !(r.source_name || '').includes(r.author) ? `<span>автор: ${esc(r.author)}</span>` : ''}</p>` : ''}
+        ${facts.length ? `<div class="facts">${facts.join('')}</div>` : ''}
+        ${steps.length ? `<button class="btn btn-primary btn-big btn-cook" id="cook" type="button">${icon('play')}Готовить по шагам</button>` : ''}
+        ${(r.categories || []).length || (r.tags || []).length ? `<div class="tags">${(r.categories || []).map((c) => `<span class="tag cat">${esc(c)}</span>`).join('')}${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
       </div>
     </section>
     ${(r.needs_review || issues.length) ? `
@@ -323,9 +341,12 @@ async function renderRecipe(key) {
         <b>${r.needs_review ? 'Нужно уточнить' : 'Замечания'}</b>
         ${issues.length ? `<ul>${issues.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
       </div></div>` : ''}
+    <nav class="recipe-tabs" aria-label="Разделы рецепта">
+      <a href="#sec-ing" data-sec="sec-ing">Ингредиенты</a><a href="#sec-steps" data-sec="sec-steps">Шаги</a><a href="#sec-shop" data-sec="sec-shop">Купить</a>
+    </nav>
     <div class="recipe-body">
       <div class="recipe-side">
-        <section class="section" aria-labelledby="h-ing">
+        <section class="section" id="sec-ing" aria-labelledby="h-ing">
           <div class="section-head">
             <h2 class="h2" id="h-ing">Ингредиенты</h2>
             <div class="scaler" role="group" aria-label="Количество порций">
@@ -336,41 +357,34 @@ async function renderRecipe(key) {
           </div>
           <div id="ings"></div>
         </section>
-        <section class="receipt-wrap" aria-labelledby="h-shop">
+        <section class="receipt-wrap" id="sec-shop" aria-labelledby="h-shop">
           <div class="section-head"><h2 class="h2" id="h-shop">Что купить</h2></div>
           <div class="store-switch" id="chain-switch" role="group" aria-label="Магазин"></div>
           <div class="receipt" id="receipt"><div class="rc-loading">Подбираю товары…<div class="bar"></div></div></div>
         </section>
       </div>
       <div class="recipe-main">
-        <section class="section" aria-labelledby="h-steps">
+        <section class="section" id="sec-steps" aria-labelledby="h-steps">
           <h2 class="h2" id="h-steps">Приготовление</h2>
-          ${(r.steps || []).length ? `<ol class="steps">${r.steps.map(stepHtml).join('')}</ol>` : '<p class="muted">Шаги не указаны. Их можно дописать вручную.</p>'}
+          ${steps.length ? `<ol class="steps">${steps.map(stepHtml).join('')}</ol>` : '<p class="muted">Шаги не указаны. Их можно дописать вручную.</p>'}
         </section>
-        ${(r.tips || []).length ? `<section class="section" style="margin-top:28px"><h2 class="h2">Советы автора</h2><ul class="tips">${r.tips.map((t) => `<li>${esc(t)}</li>`).join('')}</ul></section>` : ''}
-        <section style="margin-top:28px">
-          <details class="raw" id="raw"><summary>Исходный текст</summary><pre>Загрузка…</pre></details>
-        </section>
-        <p class="muted small" style="margin-top:16px">Добавлен ${esc(fmtDate(r.created_at))}${r.updated_at && r.updated_at !== r.created_at ? `, изменён ${esc(fmtDate(r.updated_at))}` : ''}</p>
+        ${(r.tips || []).length ? `<section class="section tips-sec"><h2 class="h2">Советы автора</h2><ul class="tips">${r.tips.map((t) => `<li>${esc(t)}</li>`).join('')}</ul></section>` : ''}
+        <details class="raw" id="raw"><summary>Исходный текст</summary><pre>Загрузка…</pre></details>
+        <p class="muted small added">Добавлен ${esc(fmtDate(r.created_at))}${r.updated_at && r.updated_at !== r.created_at ? `, изменён ${esc(fmtDate(r.updated_at))}` : ''}</p>
       </div>
     </div>`;
   hydrateImages();
 
-  const ingredients = r.ingredients || [];
   const renderIngs = () => {
-    let group = null;
-    const rows = [];
-    ingredients.forEach((ing, i) => {
-      if (ing.group && ing.group !== group) { group = ing.group; rows.push(`</ul><div class="ing-group">${esc(group)}</div><ul class="ing">`); }
-      const q = fmtQty(ing, scale);
-      rows.push(`<li><label><input type="checkbox" data-i="${i}">
-        <span class="ing-name">${esc(ing.name)}${ing.note ? `<span class="ing-note">${esc(ing.note)}</span>` : ''}</span>
-        <span class="ing-qty ${q ? '' : 'unknown'}">${q ? esc(q) : (ing.note && /вкус/i.test(ing.note) ? '' : 'не указано')}</span></label></li>`);
-    });
-    $('#ings').innerHTML = ingredients.length ? `<ul class="ing">${rows.join('')}</ul>`.replace('<ul class="ing"></ul>', '') : '<p class="muted">Ингредиенты не указаны.</p>';
+    $('#ings').innerHTML = ingredients.length ? ingListHtml(ingredients, scale, checked) : '<p class="muted">Ингредиенты не указаны.</p>';
     $('#scale-out').textContent = baseServ ? servingsText(r, scale) : `× ${fmtAmount(scale)}`;
+    if ($('#fact-serv') && baseServ) $('#fact-serv').textContent = fmtAmount(Math.round(baseServ * scale * 10) / 10);
   };
   renderIngs();
+  $('#ings').addEventListener('change', (e) => {
+    const cb = e.target.closest('input[data-i]');
+    if (cb) cb.checked ? checked.add(+cb.dataset.i) : checked.delete(+cb.dataset.i);
+  });
 
   $('.scaler').addEventListener('click', (e) => {
     const b = e.target.closest('button');
@@ -386,8 +400,30 @@ async function renderRecipe(key) {
     shop.reload(scale);
   });
 
+  // Вкладки: прокрутка к разделу и подсветка текущего.
+  const tabs = $('.recipe-tabs');
+  tabs.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-sec]');
+    if (!a) return;
+    e.preventDefault();
+    const sec = document.getElementById(a.dataset.sec);
+    window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - tabs.offsetHeight - 12, behavior: 'smooth' });
+  });
+  const spy = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (en.isIntersecting) $$('[data-sec]', tabs).forEach((a) => a.toggleAttribute('aria-current', a.dataset.sec === en.target.id));
+    }
+  }, { rootMargin: '-30% 0px -60% 0px' });
+  ['sec-ing', 'sec-steps', 'sec-shop'].forEach((id) => spy.observe(document.getElementById(id)));
+  currentCleanup = () => spy.disconnect();
+
+  $('#cook')?.addEventListener('click', () => openCook(r, () => scale, checked, () => renderIngs()));
+  $('.steps')?.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-timer]');
+    if (t) startTimer(+t.dataset.timer, `${r.title}: шаг ${+t.dataset.step + 1}`);
+  });
+
   const favBtn = $('#fav');
-  if (r.favorite) favBtn.style.color = 'var(--tomato)';
   favBtn.addEventListener('click', async () => {
     const value = !r.favorite;
     try {
@@ -395,7 +431,6 @@ async function renderRecipe(key) {
       r.favorite = value;
       favBtn.setAttribute('aria-pressed', value);
       favBtn.innerHTML = icon(value ? 'heart-fill' : 'heart');
-      favBtn.style.color = value ? 'var(--tomato)' : '';
       toast(value ? 'Добавлено в избранное' : 'Убрано из избранного');
     } catch (e) { toast(e.message); }
   });
@@ -413,11 +448,193 @@ async function renderRecipe(key) {
   await shop.init();
 }
 
-function stepHtml(s) {
+function ingListHtml(ingredients, scale, checked) {
+  let group = null;
+  const rows = [];
+  ingredients.forEach((ing, i) => {
+    if (ing.group && ing.group !== group) { group = ing.group; rows.push(`</ul><div class="ing-group">${esc(group)}</div><ul class="ing">`); }
+    const q = fmtQty(ing, scale);
+    rows.push(`<li><label><input type="checkbox" data-i="${i}" ${checked.has(i) ? 'checked' : ''}>
+      <span class="ing-name">${esc(ing.name)}${ing.note ? `<span class="ing-note">${esc(ing.note)}</span>` : ''}</span>
+      <span class="ing-qty ${q ? '' : 'unknown'}">${q ? esc(q) : (ing.note && /вкус/i.test(ing.note) ? '' : 'не указано')}</span></label></li>`);
+  });
+  return `<ul class="ing">${rows.join('')}</ul>`.replace('<ul class="ing"></ul>', '');
+}
+
+function stepHtml(s, i) {
   const meta = [];
   if (s.temperature_c != null) meta.push(`<span class="hot">${icon('flame')}${s.temperature_c} °C</span>`);
-  if (s.duration_min != null) meta.push(`<span>${icon('clock')}${esc(fmtMin(Math.round(s.duration_min)) || `${s.duration_min} мин`)}</span>`);
+  if (s.duration_min != null) {
+    meta.push(`<button type="button" class="timer-chip" data-timer="${Math.round(s.duration_min * 60)}" data-step="${i}" title="Запустить таймер">${icon('clock')}${esc(fmtMin(Math.round(s.duration_min)) || `${s.duration_min} мин`)}</button>`);
+  }
   return `<li><div><p class="step-text">${esc(s.text)}</p>${meta.length ? `<div class="step-meta">${meta.join('')}</div>` : ''}</div></li>`;
+}
+
+// =====================================================================
+// Таймеры шагов: идут, даже если закрыть режим готовки; по окончании — звук, вибрация и сообщение.
+// =====================================================================
+const timers = [];
+let timerTick = null;
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.35, 0.7].forEach((t) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime + t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.3);
+      o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.32);
+    });
+    setTimeout(() => ctx.close(), 1500);
+  } catch { /* звук недоступен */ }
+}
+function renderTimers() {
+  const now = Date.now();
+  const html = timers.map((t) => `<button type="button" class="timer-pill ${t.end <= now ? 'done' : ''}" data-cancel="${t.id}" title="${esc(t.label)}">
+    ${icon('clock')}<span>${t.end <= now ? 'Готово' : fmtClock((t.end - now) / 1000)}</span></button>`).join('');
+  $$('.timer-tray').forEach((tray) => { tray.innerHTML = html; tray.hidden = !timers.length; });
+}
+function startTimer(seconds, label) {
+  if (!seconds) return;
+  timers.push({ id: Math.random().toString(36).slice(2), end: Date.now() + seconds * 1000, label, fired: false });
+  toast(`Таймер на ${fmtClock(seconds)} запущен`);
+  if (!timerTick) {
+    timerTick = setInterval(() => {
+      const now = Date.now();
+      for (const t of timers) {
+        if (!t.fired && t.end <= now) {
+          t.fired = true;
+          beep();
+          navigator.vibrate?.([400, 200, 400, 200, 400]);
+          toast(`Время вышло: ${t.label}`, 8000);
+        }
+      }
+      // Сработавшие таймеры висят минуту, потом исчезают.
+      for (let i = timers.length - 1; i >= 0; i--) if (timers[i].end < now - 60000) timers.splice(i, 1);
+      if (!timers.length) { clearInterval(timerTick); timerTick = null; }
+      renderTimers();
+    }, 1000);
+  }
+  renderTimers();
+}
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-cancel]');
+  if (!b) return;
+  const i = timers.findIndex((t) => t.id === b.dataset.cancel);
+  if (i < 0) return;
+  if (timers[i].end <= Date.now() || await confirmDialog('Остановить таймер?', timers[i].label, 'Остановить')) {
+    timers.splice(i, 1);
+    renderTimers();
+  }
+});
+
+// =====================================================================
+// Режим «Готовить по шагам»: один шаг на экран, крупно; экран не гаснет.
+// Кнопка «Назад» телефона закрывает режим, а не уходит со страницы рецепта.
+// =====================================================================
+let closeCook = null;
+async function openCook(r, getScale, checked, onChecked) {
+  const steps = r.steps || [];
+  if (!steps.length) return;
+  let idx = 0;
+  let wake = null;
+  const el = document.createElement('div');
+  el.className = 'cook';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', `Готовим: ${r.title}`);
+  document.body.append(el);
+  document.body.classList.add('cooking');
+
+  const lockScreen = async () => {
+    try { wake = await navigator.wakeLock?.request('screen'); } catch { wake = null; }
+  };
+  lockScreen();
+  const onVisible = () => { if (document.visibilityState === 'visible' && el.isConnected) lockScreen(); };
+  document.addEventListener('visibilitychange', onVisible);
+
+  const draw = () => {
+    const s = steps[idx];
+    const last = idx === steps.length - 1;
+    el.innerHTML = `
+      <header class="cook-head">
+        <button class="round-btn" data-c="close" aria-label="Закрыть">${icon('back')}</button>
+        <div class="cook-title"><b>${esc(r.title)}</b><span>Шаг ${idx + 1} из ${steps.length}</span></div>
+        <button class="round-btn" data-c="ings" aria-label="Ингредиенты">${icon('cart')}</button>
+      </header>
+      <div class="cook-progress" aria-hidden="true">${steps.map((_, k) => `<i class="${k < idx ? 'past' : k === idx ? 'now' : ''}"></i>`).join('')}</div>
+      <div class="timer-tray" hidden></div>
+      <main class="cook-step">
+        <span class="cook-num" aria-hidden="true">${idx + 1}</span>
+        <p>${esc(s.text)}</p>
+        <div class="cook-meta">
+          ${s.temperature_c != null ? `<span class="hot">${icon('flame')}${s.temperature_c} °C</span>` : ''}
+          ${s.duration_min != null ? `<button type="button" class="btn btn-big" data-c="timer">${icon('clock')}Таймер ${esc(fmtMin(Math.round(s.duration_min)) || `${s.duration_min} мин`)}</button>` : ''}
+        </div>
+      </main>
+      <footer class="cook-nav">
+        <button class="btn btn-big" data-c="prev" ${idx ? '' : 'disabled'}>Назад</button>
+        <button class="btn btn-primary btn-big" data-c="${last ? 'done' : 'next'}">${last ? 'Готово' : 'Дальше'}</button>
+      </footer>
+      <div class="cook-sheet" hidden>
+        <div class="cook-sheet-head"><h2 class="h2">Ингредиенты</h2><button class="round-btn" data-c="ings-close" aria-label="Закрыть">×</button></div>
+        <div class="cook-ings">${ingListHtml(r.ingredients || [], getScale(), checked)}</div>
+      </div>`;
+    renderTimers();
+  };
+  const onPop = () => { if (el.isConnected) close(true); };
+  const close = (fromHistory = false) => {
+    if (!el.isConnected) return;
+    wake?.release?.().catch(() => {});
+    document.removeEventListener('visibilitychange', onVisible);
+    document.removeEventListener('keydown', onKey);
+    window.removeEventListener('popstate', onPop);
+    document.body.classList.remove('cooking');
+    el.remove();
+    closeCook = null;
+    onChecked();
+    if (!fromHistory && history.state?.cook) history.back();
+  };
+  closeCook = () => close(true);
+  history.pushState({ cook: true }, '');
+  window.addEventListener('popstate', onPop);
+  const go = (d) => { idx = Math.max(0, Math.min(steps.length - 1, idx + d)); draw(); };
+  const onKey = (e) => {
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowRight') go(1);
+    else if (e.key === 'ArrowLeft') go(-1);
+  };
+  document.addEventListener('keydown', onKey);
+  el.addEventListener('click', (e) => {
+    const c = e.target.closest('[data-c]')?.dataset.c;
+    if (c === 'close') close();
+    else if (c === 'next') go(1);
+    else if (c === 'prev') go(-1);
+    else if (c === 'done') { close(); toast('Приятного аппетита!', 3000); }
+    else if (c === 'timer') startTimer(Math.round(steps[idx].duration_min * 60), `${r.title}: шаг ${idx + 1}`);
+    else if (c === 'ings') $('.cook-sheet', el).hidden = false;
+    else if (c === 'ings-close') $('.cook-sheet', el).hidden = true;
+  });
+  el.addEventListener('change', (e) => {
+    const cb = e.target.closest('input[data-i]');
+    if (cb) cb.checked ? checked.add(+cb.dataset.i) : checked.delete(+cb.dataset.i);
+  });
+  // Свайп влево-вправо — следующий/предыдущий шаг.
+  let x0 = null;
+  el.addEventListener('touchstart', (e) => { x0 = e.target.closest('.cook-sheet') ? null : e.touches[0].clientX; }, { passive: true });
+  el.addEventListener('touchend', (e) => {
+    if (x0 == null) return;
+    const dx = e.changedTouches[0].clientX - x0;
+    if (Math.abs(dx) > 60) go(dx < 0 ? 1 : -1);
+    x0 = null;
+  });
+  draw();
 }
 
 async function recipeMenu(r) {
@@ -640,27 +857,33 @@ async function renderAdd(params) {
   const limits = await store.limits().catch(() => null);
   const preset = params.get('url') || '';
   if (params.get('shared')) toast('Ссылка добавлена в очередь', 3000);
+  const canPaste = !!navigator.clipboard?.readText;
   view.innerHTML = `
-    <header class="page-head"><h1 class="h1">Добавить рецепт</h1></header>
+    <header class="page-head"><h1 class="h1">Новый рецепт</h1></header>
     <form class="add-panel" id="add-form" novalidate>
-      <div class="seg" role="group" aria-label="Способ">
-        <button type="button" data-mode="url" aria-pressed="${addMode === 'url'}">Ссылка</button>
-        <button type="button" data-mode="text" aria-pressed="${addMode === 'text'}">Текст</button>
+      <div class="seg" role="group" aria-label="Что добавить">
+        <button type="button" data-mode="url" aria-pressed="${addMode === 'url'}">${icon('link')}Ссылка</button>
+        <button type="button" data-mode="text" aria-pressed="${addMode === 'text'}">${icon('text')}Текст</button>
       </div>
       <div class="add-row" id="mode-url" ${addMode === 'url' ? '' : 'hidden'}>
-        <label class="field"><span class="sr-only">Ссылка</span>
-          <input class="input" name="url" type="url" inputmode="url" placeholder="Вставьте ссылку на рецепт или видео" value="${esc(preset)}" autocomplete="off" enterkeyhint="go"></label>
-        <button class="btn btn-primary" type="submit">${icon('plus')}Добавить</button>
+        <label class="paste-field"><span class="sr-only">Ссылка</span>
+          <input class="input" name="url" type="url" inputmode="url" placeholder="Ссылка на рецепт" value="${esc(preset)}" autocomplete="off" enterkeyhint="go">
+          ${canPaste ? '<button type="button" class="paste-btn" id="paste">Вставить</button>' : ''}</label>
+        <button class="btn btn-primary btn-big" type="submit">${icon('plus')}Добавить</button>
       </div>
       <div id="mode-text" class="field" ${addMode === 'text' ? '' : 'hidden'}>
-        <label class="field"><span>Текст рецепта</span>
-          <textarea class="textarea" name="text" rows="8" placeholder="Скопируйте сюда текст рецепта — например, описание под видео или сообщение из чата"></textarea></label>
-        <button class="btn btn-primary" type="submit" style="justify-self:start">${icon('text')}Разобрать текст</button>
+        <label class="field"><span class="sr-only">Текст рецепта</span>
+          <textarea class="textarea" name="text" rows="8" placeholder="Скопируйте сюда текст рецепта — описание под видео, сообщение из чата, страницу из книги"></textarea></label>
+        <button class="btn btn-primary btn-big" type="submit" style="justify-self:start">${icon('text')}Разобрать текст</button>
       </div>
       <p class="form-error" id="add-err" hidden></p>
-      <p class="sources">Сайты с рецептами, YouTube, Instagram, TikTok, VK Видео, Rutube. ${DEVICE
-        ? 'Ссылку можно отправить и через «Поделиться» в любом приложении. Без связи с домашним компьютером она подождёт в очереди и уйдёт сама.'
-        : 'Обработка идёт на домашнем компьютере, обычно 1–3 минуты.'}</p>
+      <div class="sources" aria-label="Откуда можно добавлять">
+        ${['Сайты с рецептами', 'YouTube', 'Instagram', 'TikTok', 'VK Видео', 'Rutube'].map((s) => `<span>${s}</span>`).join('')}
+      </div>
+      <p class="add-hint">${DEVICE
+        ? (IOS ? 'На iPhone: скопируйте ссылку в YouTube или Instagram и нажмите «Вставить». ' : 'Удобнее всего — «Поделиться → Рецепты» прямо из YouTube или Instagram. ')
+          + 'Без связи с компьютером ссылка подождёт в очереди и уйдёт сама.'
+        : 'Рецепт разбирает этот компьютер, обычно за 1–3 минуты.'}</p>
       ${limits ? `<details class="limits"><summary>Ограничения</summary><ul>
         <li>Видео до ${limits.max_video_minutes} минут — у более длинных используются только описание и субтитры.</li>
         <li>Аудио до ${limits.max_audio_mb} МБ, видео для чтения кадров до ${limits.max_video_mb} МБ, не больше ${limits.max_frames} кадров.</li>
@@ -668,7 +891,7 @@ async function renderAdd(params) {
         <li>Одно задание обрабатывается не дольше ${limits.job_timeout_min} минут, при сбое сети — до ${limits.max_attempts} попыток.</li>
         <li>Ссылки на домашнюю сеть и служебные адреса не принимаются.</li></ul></details>` : ''}
     </form>
-    <h2 class="h2" style="margin-top:24px">Очередь и история</h2>
+    <h2 class="h2 jobs-head">Очередь и история</h2>
     <div class="jobs" id="jobs"></div>`;
 
   const form = $('#add-form');
@@ -679,6 +902,18 @@ async function renderAdd(params) {
     $('#mode-text').hidden = addMode !== 'text';
     $(addMode === 'url' ? 'input[name=url]' : 'textarea[name=text]').focus();
   }));
+  $('#paste')?.addEventListener('click', async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      const url = text.match(/https?:\/\/\S+/)?.[0];
+      if (url) { form.url.value = url; await submitJob(form, false); }
+      else if (text.length > 40) { $('[data-mode=text]', form).click(); form.text.value = text; }
+      else toast('В буфере нет ссылки — скопируйте её в YouTube, Instagram или браузере', 3500);
+    } catch {
+      form.url.focus();
+      toast('Нет доступа к буферу — нажмите на поле и выберите «Вставить»', 3500);
+    }
+  });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     await submitJob(form, false);
@@ -712,31 +947,38 @@ async function submitJob(form, force) {
   }
 }
 
+const JOB_ICON = { youtube: 'play', instagram: 'play', tiktok: 'play', vk: 'play', rutube: 'play', dzen: 'play', text: 'text' };
 async function loadJobs() {
   const box = $('#jobs');
   if (!box) return;
   let items;
   try { items = await store.listJobs(); } catch (e) { box.innerHTML = `<p class="form-error">${esc(e.message)}</p>`; return; }
-  if (!items.length) { box.innerHTML = '<p class="muted">Заданий пока не было.</p>'; return; }
+  if (!items.length) { box.innerHTML = '<p class="muted jobs-empty">Здесь появятся добавленные ссылки и ход их разбора.</p>'; return; }
   box.innerHTML = items.map((j) => {
     const title = j.title || (j.kind === 'text' ? 'Текст рецепта' : hostOf(j.url));
     const done = ['done', 'needs_review', 'duplicate'].includes(j.status) && j.recipe_keys.length;
-    const canRetry = ['error', 'done', 'needs_review', 'rejected', 'duplicate'].includes(j.status);
+    // У готового рецепта «Повторить» не нужна: есть «Обработать заново» в самом рецепте.
+    const canRetry = ['error', 'needs_review', 'rejected', 'duplicate'].includes(j.status) || (j.status === 'done' && !j.recipe_keys.length);
     const canDelete = !['downloading', 'transcribing', 'extracting'].includes(j.status);
+    const active = ['downloading', 'transcribing', 'extracting'].includes(j.status);
     const statusCls = j.status === 'pending' ? 'queued' : j.status === 'duplicate' ? 'needs_review' : j.status === 'rejected' ? 'error' : j.status;
-    return `<article class="job">
-      <div class="job-top"><span class="job-title">${esc(title)}</span><span class="status s-${statusCls}">${esc(j.status_label)}</span></div>
-      ${j.url ? `<a class="job-url" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer">${esc(j.url)}</a>` : ''}
-      ${j.stage_detail ? `<div class="job-detail">${esc(j.stage_detail)}</div>` : ''}
-      ${j.error ? `<div class="job-error">${esc(j.error)}</div>` : ''}
-      ${j.notes?.length ? `<div class="job-detail">${j.notes.map(esc).join('<br>')}</div>` : ''}
-      <div class="btn-row">
-        ${done ? j.recipe_keys.map((k, n) => `<a class="btn btn-primary" href="#/r/${esc(k)}">${j.recipe_keys.length > 1 ? `Рецепт ${n + 1}` : 'Открыть рецепт'}</a>`).join('') : ''}
-        ${canRetry ? `<button class="btn" data-retry="${esc(j.key)}">${icon('refresh')}${j.status === 'duplicate' ? 'Добавить всё равно' : 'Повторить'}</button>` : ''}
-        ${j.status === 'error' && !j.local ? `<button class="btn" data-src="${esc(j.key)}">${icon('text')}Что удалось получить</button>` : ''}
-        ${canDelete ? `<button class="btn btn-ghost" data-del="${esc(j.key)}" title="Убрать из списка">${icon('trash')}</button>` : ''}
+    const where = j.url ? `<a class="job-url" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer">${esc(hostOf(j.url))}</a>` : '';
+    return `<article class="job s-${statusCls}">
+      <span class="job-icon" aria-hidden="true">${icon(JOB_ICON[j.source_kind] || (j.kind === 'text' ? 'text' : 'link'))}</span>
+      <div class="job-body">
+        <div class="job-top"><span class="job-title">${esc(title)}</span><span class="status s-${statusCls}">${esc(j.status_label)}</span></div>
+        <div class="job-sub">${where}<span>${esc(fmtDate(j.created_at))}${j.attempts > 1 ? `, попыток: ${j.attempts}` : ''}</span></div>
+        ${active ? '<div class="job-bar" aria-hidden="true"><i></i></div>' : ''}
+        ${j.stage_detail ? `<div class="job-detail">${esc(j.stage_detail)}</div>` : ''}
+        ${j.error ? `<div class="job-error">${esc(j.error)}</div>` : ''}
+        ${j.notes?.length ? `<div class="job-detail">${j.notes.map(esc).join('<br>')}</div>` : ''}
+        ${done || canRetry || canDelete ? `<div class="btn-row">
+          ${done ? j.recipe_keys.map((k, n) => `<a class="btn btn-primary" href="#/r/${esc(k)}">${j.recipe_keys.length > 1 ? `Рецепт ${n + 1}` : 'Открыть рецепт'}</a>`).join('') : ''}
+          ${canRetry ? `<button class="btn" data-retry="${esc(j.key)}">${icon('refresh')}${j.status === 'duplicate' ? 'Добавить всё равно' : 'Повторить'}</button>` : ''}
+          ${j.status === 'error' && !j.local ? `<button class="btn" data-src="${esc(j.key)}">${icon('text')}Что удалось получить</button>` : ''}
+          ${canDelete ? `<button class="btn btn-ghost btn-icon" data-del="${esc(j.key)}" aria-label="Убрать из списка">${icon('trash')}</button>` : ''}
+        </div>` : ''}
       </div>
-      <div class="muted small">${esc(fmtDate(j.created_at))}${j.attempts > 1 ? `, попыток: ${j.attempts}` : ''}</div>
     </article>`;
   }).join('');
 }
@@ -1116,7 +1358,7 @@ window.addEventListener('appinstalled', () => { installEvent = null; $('#install
 
 async function renderSystem() {
   if (DEVICE) return renderDeviceSystem();
-  view.innerHTML = `<header class="page-head"><h1 class="h1">Система</h1></header><div class="sys-grid" id="sys"><div class="skeleton"></div><div class="skeleton"></div></div>`;
+  view.innerHTML = `<header class="page-head"><h1 class="h1">Система</h1><a class="btn btn-sm" href="instruction" target="_blank" rel="noopener">${icon('book')}Инструкция</a></header><div class="sys-grid" id="sys"><div class="skeleton"></div><div class="skeleton"></div></div>`;
   const [s, g, devs, net, cloud] = await Promise.all([store.system(), store.chains(), store.devices(),
     store.net().catch(() => null), store.cloud().catch(() => null)]);
   $('#sys').innerHTML = pausePanel(s.pause) + phonesPanel(devs.items, net) + netPanel(net) + cloudPanel(cloud) + systemPanels(s, g);
@@ -1353,11 +1595,7 @@ function systemPanels(s, g) {
       <dl class="kv"><dt>В очереди</dt><dd>${q.queued || 0}</dd><dt>В работе</dt><dd>${(q.downloading || 0) + (q.transcribing || 0) + (q.extracting || 0)}</dd>
       <dt>Готово</dt><dd>${q.done || 0}</dd><dt>Нужно уточнить</dt><dd>${q.needs_review || 0}</dd><dt>Ошибки</dt><dd>${q.error || 0}</dd>
       <dt>Обработано с запуска</dt><dd>${s.queue.processed_since_start}</dd></dl></section>
-    <section class="panel"><h3>Магазины</h3>
-      <p class="small" style="margin:0">Адрес для подбора ближайших магазинов: <b>${esc(g.location?.label || '—')}</b></p>
-      <form id="loc-form" class="add-row"><input class="input" name="q" placeholder="Город, улица, дом" autocomplete="street-address"><button class="btn" type="submit">Найти</button></form>
-      <div id="loc-res" class="store-results"></div>
-      <div id="chains" style="display:grid;gap:8px">${g.items.map(chainRow).join('')}</div></section>
+    ${storesPanel(g)}
     <section class="panel"><h3>Инструменты</h3>
       <dl class="kv"><dt>FFmpeg</dt><dd>${esc(s.tools.ffmpeg || 'не найден')}</dd><dt>yt-dlp</dt><dd>${esc(s.tools.yt_dlp)}</dd>
       <dt>Node.js (для YouTube)</dt><dd>${esc(s.tools.node || 'не найден')}</dd><dt>Свободно на диске</dt><dd>${s.disk_free_gb} ГБ</dd>
@@ -1390,8 +1628,14 @@ function bindSystemPanels() {
       } catch (err) { out.innerHTML = `<span class="bad">${esc(err.message)}</span>`; }
     } else if (st) {
       await chooseStore(st.dataset.store, () => renderSystem());
+    } else if (e.target.closest('[data-catalog]')) {
+      const chain = e.target.closest('[data-catalog]').dataset.catalog;
+      try { await store.refreshCatalog(chain); toast('Скачиваю каталог — это около минуты'); }
+      catch (err) { toast(err.message, 4000); }
+      watchCatalog();
     }
   });
+  if ((window.__chains || []).some((c) => c.catalog?.running)) watchCatalog();
   $('#loc-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const out = $('#loc-res');
@@ -1415,14 +1659,71 @@ function bindSystemPanels() {
   });
 }
 
+// Пока каталог скачивается — обновляем строки магазинов, не перерисовывая всю страницу.
+let catalogTimer = null;
+function watchCatalog() {
+  clearTimeout(catalogTimer);
+  catalogTimer = setTimeout(async () => {
+    const box = $('#chains');
+    if (!box) return;
+    try {
+      const g = await store.chains();
+      window.__chains = g.items;
+      box.innerHTML = g.items.map(chainRow).join('');
+      if (g.items.some((c) => c.catalog?.running)) watchCatalog();
+    } catch { /* следующая попытка при открытии страницы */ }
+  }, 2500);
+}
+
+function catalogLine(c) {
+  const cat = c.catalog || {};
+  if (!c.store) return '';
+  if (cat.running) {
+    const [done, all] = cat.progress || [];
+    return `<span class="wait-line"><span class="spinner small" aria-hidden="true"></span>Скачиваю каталог${done ? `: ${done.toLocaleString('ru-RU')}${all ? ` из ${all.toLocaleString('ru-RU')}` : ''}` : '…'}</span>`;
+  }
+  const parts = [];
+  if (cat.count) parts.push(`Каталог: <b>${cat.count.toLocaleString('ru-RU')}</b> ${plural(cat.count, ['товар', 'товара', 'товаров'])}, обновлён ${esc(fmtAgo(cat.updated))}`);
+  else parts.push('Каталог ещё не скачан — цены ищутся на сайте при каждом запросе');
+  if (cat.error) parts.push(`<span class="bad">${esc(cat.error)}</span>`);
+  return parts.join('<br>');
+}
+
 function chainRow(c) {
   const st = c.status;
-  return `<div style="display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:12px">
-    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(c.name)}</b>
-      <span class="btn-row"><button class="btn" style="min-height:34px" data-store="${c.id}">Магазин</button><button class="btn" style="min-height:34px" data-check="${c.id}">Проверить</button></span></div>
-    <div class="small muted">${c.store ? esc(c.store.address || c.store.id) : 'магазин не выбран'}</div>
-    <div class="small" id="chk-${c.id}">${st ? (st.ok ? '<span class="ok">Последний запрос успешен</span>' : `<span class="bad">${esc(st.message)}</span>`) : ''}</div>
+  return `<div class="chain">
+    <div class="chain-head"><span class="chain-mark" data-chain="${c.id}" aria-hidden="true"></span><b>${esc(c.name)}</b>
+      <span class="btn-row">
+        <button class="btn btn-sm" data-store="${c.id}">Магазин</button>
+        ${c.store ? `<button class="btn btn-sm" data-catalog="${c.id}" ${c.catalog?.running ? 'disabled' : ''}>${c.catalog?.count ? 'Обновить каталог' : 'Скачать каталог'}</button>` : ''}
+        <button class="btn btn-sm btn-ghost" data-check="${c.id}">Проверить</button>
+      </span></div>
+    <div class="small muted">${c.store ? esc(c.store.address || c.store.id) : 'Магазин не выбран — укажите адрес выше'}</div>
+    <div class="small">${catalogLine(c)}</div>
+    <div class="small" id="chk-${c.id}">${st && !st.ok ? `<span class="bad">${esc(st.message)}</span>` : ''}</div>
   </div>`;
+}
+
+const VPN_HELP = `<details class="vpn-help"><summary>Пятёрочка или Лента «не пускают»? Как исправить</summary>
+  <p>Эти сайты отвечают только российским адресам, а запросы компьютера идут через VPN. Нужно, чтобы сайты магазинов открывались мимо VPN:</p>
+  <ol>
+    <li>Откройте AmneziaVPN → «Настройки» → «Соединение» → «Раздельное туннелирование» (для сайтов). Названия пунктов могут немного отличаться в вашей версии.</li>
+    <li>Включите его в режиме «Адреса из списка не должны открываться через VPN».</li>
+    <li>Добавьте: <b>5ka.ru</b>, <b>5d.5ka.ru</b>, <b>lenta.com</b>, <b>magnit.ru</b>.</li>
+    <li>Переподключите VPN и нажмите здесь «Проверить» у Пятёрочки и Ленты, затем «Магазин», чтобы выбрать ближайший.</li>
+  </ol>
+  <p class="muted">YouTube и всё остальное продолжат идти через VPN.</p></details>`;
+
+function storesPanel(g) {
+  window.__chains = g.items;
+  const blocked = g.items.some((c) => (c.status && !c.status.ok) || /VPN|не пускает|антибот/i.test(c.catalog?.error || ''));
+  return `<section class="panel wide"><h3>Магазины</h3>
+    <p class="small" style="margin:0">Адрес, рядом с которым искать магазины: <b>${esc(g.location?.label || '—')}</b></p>
+    <form id="loc-form" class="add-row"><input class="input" name="q" placeholder="Город, улица, дом" autocomplete="street-address"><button class="btn" type="submit">Найти</button></form>
+    <div id="loc-res" class="store-results"></div>
+    <div id="chains" class="chain-list">${g.items.map(chainRow).join('')}</div>
+    <p class="small muted" style="margin:0">Каталог выбранного магазина компьютер скачивает раз в сутки, около 5 утра. По нему список покупок к рецепту собирается мгновенно и не зависит от того, отвечает ли сайт магазина.</p>
+    ${blocked ? VPN_HELP : ''}</section>`;
 }
 
 function shortUrl(u) { return String(u || '').replace(/^https?:\/\//, ''); }

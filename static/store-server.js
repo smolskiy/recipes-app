@@ -26,6 +26,7 @@ const withKey = (r) => (r ? { ...r, key: String(r.id) } : r);
 export const serverStore = {
   mode: 'server',
   api,
+  refreshCatalog: (chain) => api(`api/grocery/catalog/${chain}/refresh`, { method: 'POST' }),
   async init() {},
   imageUrl: async (name) => (name ? `images/${name}` : null),
   async listRecipes({ q, category, favorite, review }) {
