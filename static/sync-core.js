@@ -5,6 +5,8 @@ const DB_NAME = 'recipes-app';
 const DB_VERSION = 1;
 const NATIVE = typeof self !== 'undefined' && !!self.Capacitor?.isNativePlatform?.();
 export const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('recipes-sync') : null;
+// BroadcastChannel не доставляет сообщение тому же окну, которое его отправило, — поэтому ещё и локальные события.
+export const events = new EventTarget();
 
 // ---------- IndexedDB ----------
 let dbPromise = null;
@@ -45,7 +47,9 @@ export function newId() {
 }
 
 function emit(type, data = {}) {
-  try { channel?.postMessage({ type, ...data }); } catch { /* закрыт */ }
+  const msg = { type, ...data };
+  try { channel?.postMessage(msg); } catch { /* закрыт */ }
+  events.dispatchEvent(new MessageEvent('message', { data: msg }));
 }
 
 // ---------- Связь с ПК ----------

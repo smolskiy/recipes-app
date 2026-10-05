@@ -1242,7 +1242,7 @@ async function start() {
     if ('serviceWorker' in navigator && (isSecureContext || NATIVE)) {
       navigator.serviceWorker.register('sw.js', { type: 'module', scope: './' }).catch((e) => console.warn('SW', e));
     }
-    store.core.channel?.addEventListener('message', async (ev) => {
+    const onSync = async (ev) => {
       const t = ev.data?.type;
       if (t === 'conn' || t === 'outbox' || t === 'synced' || t === 'sync-error') renderConn();
       if (t === 'outbox' || t === 'synced') refreshBadge();
@@ -1252,7 +1252,9 @@ async function start() {
       }
       if (t === 'image') hydrateImages();
       if (t === 'auth') toast('Компьютер отключил этот телефон — подключите его заново', 5000);
-    });
+    };
+    store.core.channel?.addEventListener('message', onSync); // из service worker и других вкладок
+    store.core.events.addEventListener('message', onSync); // из этой же страницы
     const tick = async () => {
       if (document.visibilityState !== 'visible') return;
       await store.sync('tick');
