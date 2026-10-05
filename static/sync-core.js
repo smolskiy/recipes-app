@@ -380,7 +380,8 @@ async function pushChanges() {
 }
 
 const RECIPE_FIELDS = ['title', 'description', 'servings', 'servings_text', 'prep_time_min', 'cook_time_min', 'total_time_min',
-  'ingredients', 'steps', 'tips', 'categories', 'tags', 'author', 'source_url', 'source_name', 'issues', 'needs_review', 'favorite'];
+  'ingredients', 'steps', 'tips', 'categories', 'tags', 'author', 'source_url', 'source_name', 'issues', 'needs_review', 'favorite',
+  'saved'];
 export function toRecipeIn(r) {
   const out = {};
   for (const f of RECIPE_FIELDS) out[f] = r[f] ?? (Array.isArray(r[f]) ? [] : null);
@@ -419,19 +420,28 @@ async function pullChanges() {
     await kv.set('cursor', cursor);
     if (!res.more) break;
   }
-  await fetchMissingImages();
   return changed;
 }
 
-async function fetchMissingImages() {
-  const recipes = await dbAll('recipes');
+export async function fetchImage(name) {
+  const res = await api(`/api/device/images/${name}`, { timeout: 30000 });
+  await dbPut('images', { name, blob: b64ToBlob(res.data, res.type || 'image/jpeg') });
+  emit('image', { name });
+}
+
+// Картинки: сначала своих рецептов, потом каналов (их сотни) — и не дольше 20 секунд за раз,
+// остальное докачается при следующих синхронизациях (и сразу для карточек на экране).
+async function fetchMissingImages(budgetMs = 20000) {
+  const recipes = (await dbAll('recipes')).filter((r) => !r._deleted && r.image);
   const have = new Set((await dbAll('images')).map((i) => i.name));
-  const need = [...new Set(recipes.map((r) => r.image).filter((n) => n && !have.has(n)))];
+  const mine = (r) => !r.channel_id || r.saved;
+  const ordered = [...recipes.filter(mine), ...recipes.filter((r) => !mine(r))];
+  const need = [...new Set(ordered.map((r) => r.image).filter((n) => !have.has(n)))];
+  const until = Date.now() + budgetMs;
   for (const name of need) {
+    if (Date.now() > until) break;
     try {
-      const res = await api(`/api/device/images/${name}`, { timeout: 30000 });
-      await dbPut('images', { name, blob: b64ToBlob(res.data, res.type || 'image/jpeg') });
-      emit('image', { name });
+      await fetchImage(name);
     } catch (e) {
       if (e instanceof OfflineError || e instanceof AuthError) throw e;
     }
@@ -465,6 +475,7 @@ export function syncAll(reason = '') {
       await kv.set('lastSync', new Date().toISOString());
       await kv.del('lastSyncError');
       emit('synced', { changed, reason });
+      await fetchMissingImages().catch(() => {}); // картинки — не повод считать синхронизацию неудачной
       return { ok: true, changed };
     } catch (e) {
       await kv.set('lastSyncError', e.message);

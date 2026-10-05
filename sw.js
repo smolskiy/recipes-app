@@ -5,11 +5,12 @@
 
 import { enqueue, extractUrl, syncAll } from './static/sync-core.js';
 
-const VERSION = 'd55ac7e82e46';
+const VERSION = '1fd50890ceb0';
 const CACHE = `recipes-shell-${VERSION}`;
 const SHELL = [
   './', 'manifest.webmanifest',
   'static/app.js', 'static/store-device.js', 'static/store-server.js', 'static/sync-core.js', 'static/styles.css',
+  'static/listing.js', 'static/pantry.js',
   'static/fonts/onest-cyrillic.woff2', 'static/fonts/onest-latin.woff2',
   'static/fonts/unbounded-cyrillic.woff2', 'static/fonts/unbounded-latin.woff2',
   'static/icon.svg', 'static/icon-192.png', 'static/icon-512.png',

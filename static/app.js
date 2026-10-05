@@ -1,6 +1,8 @@
 // Наши рецепты — клиентская часть без сборки.
 // Два режима: «ПК» (домашняя сеть, данные на сервере) и «телефон» (данные на телефоне, ПК — обработка).
 
+import { authorOf, facets, filterItems, inCollection, SORTS, SORTS_FOR, sortItems } from './listing.js';
+import { DEFAULT_STAPLES, GROUPS, matchPantry, productCatalog } from './pantry.js';
 import { serverStore } from './store-server.js';
 
 const view = document.getElementById('view');
@@ -101,6 +103,8 @@ function parseHash() {
 async function setImg(img, name) {
   const url = await store.imageUrl(name);
   if (url) {
+    if (img.getAttribute('src') === url) return;
+    img.closest('.dish, .hero-img')?.classList.remove('noimg'); // картинка докачалась позже
     img.onload = () => img.closest('.dish, .hero-img')?.classList.add('loaded');
     img.onerror = () => img.closest('.dish, .hero-img')?.classList.add('noimg');
     img.src = url;
@@ -194,7 +198,10 @@ async function route() {
   const { path, params } = parseHash();
   const parts = path.split('/').filter(Boolean);
   document.body.dataset.route = parts[0] || 'list';
-  const nav = parts[0] === 'add' ? 'add' : ['system', 'pair', 'phone'].includes(parts[0]) ? 'system' : 'list';
+  // Рецепт подсвечивает раздел, из которого его открыли.
+  const section = parts[0] === 'r' ? lastListHash.replace(/^#\/?/, '').split(/[/?]/)[0] : parts[0];
+  const nav = section === 'add' ? 'add' : ['system', 'pair', 'phone'].includes(section) ? 'system'
+    : ['channels', 'pantry'].includes(section) ? section : 'list';
   // Вкладка подсвечивается сразу, а если страница готовится дольше мгновения — сверху бежит полоска.
   $$('.nav-item').forEach((a) => (a.dataset.nav === nav ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
   const slow = setTimeout(() => { if (!isStale(seq)) document.body.classList.add('routing'); }, 250);
@@ -210,7 +217,10 @@ async function route() {
     else if (parts[0] === 'system') await renderSystem(seq);
     else if (parts[0] === 'pair' && DEVICE) await renderPair(params, seq);
     else if (parts[0] === 'phone' && !DEVICE) await renderPhoneSetup(seq);
-    else await renderList(params);
+    else if (parts[0] === 'channels' && parts[1] === 'manage') await renderChannels(seq);
+    else if (parts[0] === 'channels') await renderList(params, 'channels', seq);
+    else if (parts[0] === 'pantry') await renderPantry(seq);
+    else await renderList(params, 'mine', seq);
   } catch (e) {
     if (!isStale(seq)) {
       view.innerHTML = `<div class="notice error">${icon('warn')}<div><b>Не удалось открыть страницу</b><div class="small">${esc(e.message)}</div></div></div>`;
@@ -225,63 +235,175 @@ window.addEventListener('hashchange', () => { route(); window.scrollTo(0, 0); })
 // =====================================================================
 // Коллекция
 // =====================================================================
-const listState = { q: '', category: '', favorite: false, review: false };
+const readPref = (k, d) => { try { return localStorage.getItem(k) || d; } catch { return d; } };
+const writePref = (k, v) => { try { localStorage.setItem(k, v); } catch { /* приватный режим */ } };
+// Фильтры каждого раздела живут, пока открыто приложение; сортировка запоминается.
+const listStates = {
+  mine: { q: '', category: '', favorite: false, review: false, author: '', sort: readPref('sort.mine', 'new') },
+  channels: { q: '', category: '', saved: false, author: '', sort: readPref('sort.channels', 'popular') },
+};
+let listData = null; // { collection, items } — все карточки открытого раздела
+let lastListHash = '#/'; // куда возвращаться со страницы рецепта
+let listIO = null;
+const PAGE = 48;
 
-async function renderList(params) {
-  listState.q = params.get('q') || listState.q;
+async function renderList(params, collection = 'mine', seq = navSeq) {
+  const st = listStates[collection];
+  const isCh = collection === 'channels';
+  if (params.get('q')) st.q = params.get('q');
+  if (params.has('author')) { st.author = params.get('author'); st.category = ''; }
+  lastListHash = isCh ? '#/channels' : '#/';
+  listData = null;
   view.innerHTML = `
     <header class="page-head">
-      <h1 class="h1">Что готовим?</h1>
+      <h1 class="h1">${isCh ? 'Каналы' : 'Что готовим?'}</h1>
       <span class="count" id="count"></span>
+      ${isCh ? `<a class="btn btn-sm" href="#/channels/manage">${icon('tune')}Управление</a>` : ''}
     </header>
+    ${isCh ? '<div id="crawl"></div>' : ''}
     <label class="search">${icon('search')}
       <span class="sr-only">Поиск</span>
-      <input class="input" id="q" type="search" placeholder="Название, продукт или тег" value="${esc(listState.q)}" autocomplete="off" enterkeyhint="search">
+      <input class="input" id="q" type="search" placeholder="${isCh ? 'Блюдо, продукт или канал' : 'Название, продукт или тег'}" value="${esc(st.q)}" autocomplete="off" enterkeyhint="search">
     </label>
+    ${isCh ? '<div class="chips authors" id="authors" role="toolbar" aria-label="Каналы"></div>' : ''}
+    <div class="list-tools">
+      ${isCh ? '' : '<label class="tool" hidden><span class="sr-only">Автор</span><select class="select select-sm" id="author"></select></label>'}
+      <label class="tool">${icon('sort')}<span class="sr-only">Сортировка</span><select class="select select-sm" id="sort">
+        ${SORTS_FOR[collection].map((k) => `<option value="${k}" ${st.sort === k ? 'selected' : ''}>${SORTS[k].label}</option>`).join('')}</select></label>
+    </div>
     <div class="chips" id="chips" role="toolbar" aria-label="Фильтры"></div>
     <div id="results"><div class="list"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div></div>`;
   let timer;
   $('#q').addEventListener('input', (e) => {
     clearTimeout(timer);
-    timer = setTimeout(() => { listState.q = e.target.value.trim(); loadList(); }, 220);
+    timer = setTimeout(() => { st.q = e.target.value.trim(); drawList(); }, 220);
   });
   $('#chips').addEventListener('click', (e) => {
     const b = e.target.closest('.chip');
     if (!b) return;
     const f = b.dataset.f;
-    if (f === 'all') { listState.category = ''; listState.favorite = false; listState.review = false; }
-    else if (f === 'fav') listState.favorite = !listState.favorite;
-    else if (f === 'review') listState.review = !listState.review;
-    else listState.category = listState.category === f ? '' : f;
-    loadList();
+    if (f === 'all') Object.assign(st, { category: '', favorite: false, review: false, saved: false });
+    else if (f === 'fav') st.favorite = !st.favorite;
+    else if (f === 'review') st.review = !st.review;
+    else if (f === 'saved') st.saved = !st.saved;
+    else st.category = st.category === f ? '' : f;
+    drawList();
   });
-  await loadList();
+  $('#authors')?.addEventListener('click', (e) => {
+    const b = e.target.closest('.chip');
+    if (!b) return;
+    st.author = st.author === b.dataset.a ? '' : b.dataset.a;
+    st.category = '';
+    drawList();
+  });
+  $('#author')?.addEventListener('change', (e) => { st.author = e.target.value; drawList(); });
+  $('#sort').addEventListener('change', (e) => { st.sort = e.target.value; writePref(`sort.${collection}`, st.sort); drawList(); });
+  currentCleanup = () => { listIO?.disconnect(); listIO = null; listData = null; };
+  const data = await store.listRecipes({ collection });
+  if (isStale(seq)) return;
+  listData = { collection, items: data.items };
+  drawList();
+  if (isCh) showCrawl(seq);
 }
 
-async function loadList() {
-  const data = await store.listRecipes(listState);
-  const counts = data.category_counts || {};
-  const anyFilter = listState.category || listState.favorite || listState.review;
-  const chips = [`<button class="chip" data-f="all" aria-pressed="${!anyFilter}">Все</button>`,
-    `<button class="chip" data-f="fav" aria-pressed="${listState.favorite}">${icon('heart')}Избранное</button>`,
-    `<button class="chip" data-f="review" aria-pressed="${listState.review}">${icon('warn')}Нужно уточнить</button>`];
-  for (const c of data.categories || CATEGORIES) {
-    if (!counts[c] && listState.category !== c) continue;
-    chips.push(`<button class="chip" data-f="${esc(c)}" aria-pressed="${listState.category === c}">${esc(c)} <span class="count">${counts[c] || 0}</span></button>`);
+// Новые рецепты пришли синхронизацией: обновляем список, если человек не листает его прямо сейчас.
+async function reloadList() {
+  if (!listData || window.scrollY > 120) return;
+  const { collection } = listData;
+  const data = await store.listRecipes({ collection });
+  if (listData?.collection !== collection || !$('#results')) return;
+  listData = { collection, items: data.items };
+  drawList();
+}
+
+function drawList() {
+  if (!listData || !$('#results')) return;
+  const { collection, items } = listData;
+  const st = listStates[collection];
+  const isCh = collection === 'channels';
+  const { authors } = facets(items);
+  if (st.author && !authors.some(([a]) => a === st.author)) st.author = '';
+  if (isCh) {
+    $('#authors').innerHTML = [`<button class="chip" data-a="" aria-pressed="${!st.author}">Все каналы <span class="count">${items.length}</span></button>`,
+      ...authors.map(([a, n]) => `<button class="chip" data-a="${esc(a)}" aria-pressed="${st.author === a}">${esc(a)} <span class="count">${n}</span></button>`)].join('');
+  } else {
+    const sel = $('#author');
+    sel.closest('.tool').hidden = authors.length < 2;
+    sel.innerHTML = `<option value="">Все авторы</option>${authors.map(([a, n]) => `<option value="${esc(a)}" ${st.author === a ? 'selected' : ''}>${esc(a)} · ${n}</option>`).join('')}`;
   }
-  if (!$('#chips')) return;
+  const byAuthor = st.author ? items.filter((r) => authorOf(r) === st.author) : items;
+  const counts = facets(byAuthor).categories;
+  const anyFilter = st.category || st.favorite || st.review || st.saved;
+  const chips = [`<button class="chip" data-f="all" aria-pressed="${!anyFilter}">Все</button>`];
+  if (isCh) chips.push(`<button class="chip" data-f="saved" aria-pressed="${!!st.saved}">${icon('check')}У меня</button>`);
+  else {
+    chips.push(`<button class="chip" data-f="fav" aria-pressed="${st.favorite}">${icon('heart')}Избранное</button>`);
+    if (items.some((r) => r.needs_review)) chips.push(`<button class="chip" data-f="review" aria-pressed="${st.review}">${icon('warn')}Нужно уточнить</button>`);
+  }
+  for (const c of CATEGORIES) {
+    if (!counts[c] && st.category !== c) continue;
+    chips.push(`<button class="chip" data-f="${esc(c)}" aria-pressed="${st.category === c}">${esc(c)} <span class="count">${counts[c] || 0}</span></button>`);
+  }
   $('#chips').innerHTML = chips.join('');
-  $('#count').textContent = data.items.length ? `${data.items.length} ${plural(data.items.length, ['рецепт', 'рецепта', 'рецептов'])}` : '';
+  let list = filterItems(items, st);
+  if (st.saved) list = list.filter((r) => r.saved);
+  list = sortItems(list, st.sort);
+  $('#count').textContent = list.length ? `${list.length} ${plural(list.length, ['рецепт', 'рецепта', 'рецептов'])}` : '';
   const box = $('#results');
-  if (!data.items.length) {
-    box.innerHTML = (listState.q || anyFilter)
+  listIO?.disconnect();
+  if (!list.length) {
+    const filtered = st.q || anyFilter || st.author;
+    box.innerHTML = filtered
       ? `<div class="empty"><p>Ничего не нашлось. Попробуйте другое слово или сбросьте фильтры.</p></div>`
-      : `<div class="empty"><span class="plate" aria-hidden="true"><i></i></span><p>Здесь пока пусто. Добавьте ссылку на рецепт с сайта, YouTube или Instagram — он появится тут в едином виде.</p><a class="btn btn-primary" href="#/add">${icon('plus')}Добавить рецепт</a></div>`;
+      : isCh
+        ? `<div class="empty"><span class="plate" aria-hidden="true"><i></i></span><p>Здесь появятся рецепты с YouTube-каналов. Компьютер собирает их сам, по одному видео, когда свободен.</p><a class="btn btn-primary" href="#/channels/manage">${icon('plus')}Добавить канал</a></div>`
+        : `<div class="empty"><span class="plate" aria-hidden="true"><i></i></span><p>Здесь пока пусто. Добавьте ссылку на рецепт с сайта, YouTube или Instagram — он появится тут в едином виде.</p><a class="btn btn-primary" href="#/add">${icon('plus')}Добавить рецепт</a></div>`;
     return;
   }
-  box.innerHTML = `<div class="list">${data.items.map(cardHtml).join('')}</div>`;
-  hydrateImages(box);
+  renderCards(box, list, (r) => cardHtml(r, { views: isCh }));
 }
+
+// Карточки порциями: с каналами рецептов сотни, рисовать все сразу — долго и тяжело для телефона.
+function renderCards(box, list, render) {
+  box.innerHTML = '<div class="list"></div><div class="more-wrap"><button class="btn" type="button" hidden>Показать ещё</button></div>';
+  const grid = $('.list', box);
+  const btn = $('.more-wrap button', box);
+  let shown = 0;
+  const more = () => {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = list.slice(shown, shown + PAGE).map(render).join('');
+    hydrateImages(tmp);
+    grid.append(...tmp.children);
+    shown = Math.min(list.length, shown + PAGE);
+    btn.hidden = shown >= list.length;
+    btn.textContent = `Показать ещё ${list.length - shown}`;
+  };
+  btn.addEventListener('click', more);
+  const io = new IntersectionObserver((en) => { if (en.some((e) => e.isIntersecting) && !btn.hidden) more(); }, { rootMargin: '800px' });
+  io.observe(btn);
+  listIO?.disconnect();
+  listIO = io;
+  more();
+}
+
+// Над списком каналов: идёт ли сбор (только когда компьютер на связи; без связи — молча).
+async function showCrawl(seq) {
+  let data;
+  try { data = await store.channels(); } catch { return; }
+  const box = $('#crawl');
+  if (isStale(seq) || !box) return;
+  const total = data.items.reduce((s, c) => s + c.stats.total - c.stats.exists, 0);
+  const left = data.items.reduce((s, c) => s + (c.enabled ? c.stats.pending + c.stats.queued : 0), 0);
+  const done = data.items.reduce((s, c) => s + c.stats.done, 0);
+  if (!left && !data.status.backoff_until) return;
+  const until = data.status.backoff_until ? fmtTime(data.status.backoff_until) : '';
+  box.innerHTML = `<a class="crawl" href="#/channels/manage">${icon('refresh')}<span>${until
+    ? `YouTube попросил подождать — сбор продолжится в ${esc(until)}`
+    : `Компьютер собирает рецепты: готово ${done} из ${total}`}</span></a>`;
+}
+
+const fmtViews = (n) => (n >= 1e6 ? `${String(Math.round(n / 1e5) / 10).replace('.', ',')} млн` : n >= 1e3 ? `${Math.round(n / 1e3)} тыс.` : String(n));
+const fmtTime = (iso) => new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
 // Тарелка вместо фото: белая эмаль с кобальтовой каймой, в центре — первая буква; фон — по категории.
 const CAT_TINT = { 'Выпечка': 'butter', 'Десерты': 'butter', 'Завтраки': 'butter', 'Супы': 'tomato', 'Основные блюда': 'tomato',
@@ -292,19 +414,289 @@ function plateHtml(r, big = false) {
   return `<span class="plate ${big ? 'big' : ''}" data-tint="${tint}" aria-hidden="true"><i>${esc(letter)}</i></span>`;
 }
 
-function cardHtml(r) {
+function cardHtml(r, { views = false, missing = null } = {}) {
   const time = fmtMin(r.total_time_min);
   const meta = [];
   if (time) meta.push(`<span>${icon('clock')}${esc(time)}</span>`);
-  if (r.servings) meta.push(`<span>${icon('people')}${esc(fmtAmount(r.servings))}</span>`);
+  if (views && r.video_views) meta.push(`<span>${icon('eye')}${esc(fmtViews(r.video_views))}</span>`);
+  else if (r.servings) meta.push(`<span>${icon('people')}${esc(fmtAmount(r.servings))}</span>`);
   if (!meta.length && r.source_name) meta.push(`<span>${esc(r.source_name.split(',')[0])}</span>`);
+  const miss = missing == null ? ''
+    : missing.length ? `<p class="missing">нет: ${esc(missing.join(', ').toLowerCase())}</p>` : `<p class="missing ok">${icon('check')}всё есть</p>`;
   return `<a class="card" href="#/r/${esc(r.key)}">
     <div class="dish">${plateHtml(r)}${r.image ? `<img data-img="${esc(r.image)}" alt="" loading="lazy">` : ''}
       ${r.favorite ? `<span class="fav" title="В избранном">${icon('heart-fill')}</span>` : ''}
-      ${r.needs_review ? `<span class="review-dot" title="Нужно уточнить">${icon('warn')}</span>` : ''}</div>
+      ${r.channel_id && r.saved && views ? `<span class="saved-dot" title="В ваших рецептах">${icon('check')}</span>`
+        : r.needs_review ? `<span class="review-dot" title="Нужно уточнить">${icon('warn')}</span>` : ''}</div>
     <p class="card-title">${esc(r.title)}</p>
     ${meta.length ? `<div class="meta">${meta.join('')}</div>` : ''}
+    ${miss}
   </a>`;
+}
+
+// =====================================================================
+// Есть дома
+// =====================================================================
+const pantryUi = { tab: null, scope: 'all', q: '', open: new Set() };
+const GROUP_LIMIT = 18;
+
+async function loadPantry() {
+  const saved = (await store.getPantry().catch(() => null)) || {};
+  return {
+    items: new Set(saved.items || []),
+    staples: Array.isArray(saved.staples) ? saved.staples : [...DEFAULT_STAPLES],
+    ignoreSpices: saved.ignoreSpices ?? true,
+  };
+}
+
+async function renderPantry(seq = navSeq) {
+  lastListHash = '#/pantry';
+  const [pantry, data] = await Promise.all([loadPantry(), store.listRecipes({ collection: 'all' })]);
+  if (isStale(seq)) return;
+  const all = data.items;
+  const catalog = productCatalog(all);
+  const labels = new Map(catalog.map((c) => [c.key, c.label]));
+  const save = () => store.setPantry({ items: [...pantry.items], staples: pantry.staples, ignoreSpices: pantry.ignoreSpices }).catch(() => {});
+  const matches = () => matchPantry(all.filter((r) => inCollection(r, pantryUi.scope)), [...pantry.items],
+    { staples: pantry.staples, ignoreSpices: pantry.ignoreSpices });
+  if (!pantryUi.tab) pantryUi.tab = pantry.items.size ? 'dishes' : 'products';
+  view.innerHTML = `
+    <header class="page-head"><h1 class="h1">Есть дома</h1></header>
+    <p class="lead pantry-lead">Отметьте продукты, которые есть, — приложение подберёт блюда из ваших рецептов и рецептов каналов.</p>
+    <div class="seg pantry-tabs" role="group" aria-label="Раздел">
+      <button type="button" data-tab="products">${icon('basket')}Продукты <span class="n" id="n-prod"></span></button>
+      <button type="button" data-tab="dishes">${icon('book')}Блюда <span class="n" id="n-dish"></span></button>
+    </div>
+    <div id="pbody"></div>`;
+  const counts = () => {
+    $('#n-prod').textContent = pantry.items.size || '';
+    $('#n-dish').textContent = pantry.items.size ? matches().length : '';
+  };
+  const chip = (key, label, count, pressed, attr = 'k') => `<button class="chip" type="button" data-${attr}="${esc(key)}" aria-pressed="${pressed}">${pressed && attr === 'k' ? icon('check') : ''}${esc(label)}${count ? ` <span class="count">${count}</span>` : ''}</button>`;
+
+  const drawGroups = () => {
+    const box = $('#groups');
+    if (!box) return;
+    const q = pantryUi.q.toLowerCase().replace(/ё/g, 'е');
+    if (q) {
+      const found = catalog.filter((c) => c.label.toLowerCase().replace(/ё/g, 'е').includes(q)).slice(0, 60);
+      box.innerHTML = found.length ? `<div class="chip-wrap">${found.map((c) => chip(c.key, c.label, c.count, pantry.items.has(c.key))).join('')}</div>`
+        : '<p class="muted small">Такого продукта нет ни в одном рецепте.</p>';
+      return;
+    }
+    box.innerHTML = GROUPS.filter(([g]) => g !== 'staple').map(([g, title]) => {
+      const list = catalog.filter((c) => c.group === g);
+      if (!list.length) return '';
+      const open = pantryUi.open.has(g);
+      const shown = open ? list : list.slice(0, GROUP_LIMIT);
+      return `<section class="pgroup"><h3 class="pgroup-h">${esc(title)}</h3><div class="chip-wrap">
+        ${shown.map((c) => chip(c.key, c.label, c.count, pantry.items.has(c.key))).join('')}
+        ${list.length > shown.length ? `<button class="chip chip-more" type="button" data-more="${g}">ещё ${list.length - shown.length}</button>` : ''}</div></section>`;
+    }).join('');
+  };
+  const drawHave = () => {
+    const box = $('#have');
+    if (!box) return;
+    const keys = [...pantry.items];
+    box.innerHTML = keys.length ? keys.map((k) => chip(k, labels.get(k) || k, 0, true)).join('')
+      : '<p class="muted small">Пока ничего не отмечено — выберите продукты ниже или найдите через поиск.</p>';
+    $('#clear').hidden = !keys.length;
+    $('#go').hidden = !keys.length;
+    $('#go').innerHTML = `${icon('book')}Показать блюда · ${keys.length ? matches().length : 0}`;
+  };
+
+  const drawProducts = () => {
+    const extra = pantry.staples.filter((s) => !DEFAULT_STAPLES.includes(s));
+    $('#pbody').innerHTML = `
+      <section class="pantry-have">
+        <div class="section-head"><h2 class="h2">У меня есть</h2><button class="btn btn-ghost btn-sm" type="button" id="clear">Очистить</button></div>
+        <div class="chip-wrap" id="have"></div>
+      </section>
+      <label class="search">${icon('search')}<span class="sr-only">Найти продукт</span>
+        <input class="input" id="pq" type="search" placeholder="Найти продукт" value="${esc(pantryUi.q)}" autocomplete="off"></label>
+      <div id="groups"></div>
+      <details class="staples panel">
+        <summary>Всегда есть дома: ${esc(pantry.staples.map((k) => labels.get(k) || k).join(', ').toLowerCase() || 'ничего')}</summary>
+        <p class="small muted">Эти продукты отмечать не нужно — они считаются имеющимися. Нажмите, чтобы убрать или вернуть.</p>
+        <div class="chip-wrap" id="staples">${[...DEFAULT_STAPLES, ...extra].map((k) => chip(k, labels.get(k) || k[0].toUpperCase() + k.slice(1), 0, pantry.staples.includes(k), 's')).join('')}</div>
+        <label class="check"><input type="checkbox" id="spices" ${pantry.ignoreSpices ? 'checked' : ''}> Специи и травы не считать (паприка, корица, лавровый лист…)</label>
+      </details>
+      <button class="btn btn-primary btn-big pantry-go" type="button" id="go"></button>`;
+    drawHave();
+    drawGroups();
+    let timer;
+    $('#pq').addEventListener('input', (e) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { pantryUi.q = e.target.value.trim(); drawGroups(); }, 150);
+    });
+    $('#clear').addEventListener('click', () => { pantry.items.clear(); save(); drawHave(); drawGroups(); counts(); });
+    $('#go').addEventListener('click', () => { pantryUi.tab = 'dishes'; drawTab(); window.scrollTo(0, 0); });
+    $('#spices').addEventListener('change', (e) => { pantry.ignoreSpices = e.target.checked; save(); drawHave(); counts(); });
+  };
+
+  const drawDishes = () => {
+    const scopes = [['all', 'Везде'], ['mine', 'Мои рецепты'], ['channels', 'Каналы']];
+    const head = `<div class="chips" id="scope" role="group" aria-label="Где искать">${scopes.map(([k, t]) => `<button class="chip" type="button" data-scope="${k}" aria-pressed="${pantryUi.scope === k}">${t}</button>`).join('')}</div>`;
+    if (!pantry.items.size) {
+      $('#pbody').innerHTML = `${head}<div class="empty"><span class="plate" aria-hidden="true"><i></i></span><p>Отметьте на вкладке «Продукты», что есть дома: яйца, курица, картошка… Соль, сахар, масло и специи отмечать не нужно.</p><button class="btn btn-primary" type="button" data-tab="products">${icon('basket')}Выбрать продукты</button></div>`;
+      return;
+    }
+    const res = matches();
+    const groups = [[0, 'Можно приготовить'], [1, 'Не хватает одного продукта'], [2, 'Не хватает двух продуктов']];
+    const have = [...pantry.items].map((k) => labels.get(k) || k).join(', ').toLowerCase();
+    $('#pbody').innerHTML = `${head}
+      <p class="small muted pantry-from">Из того, что есть: ${esc(have)} · <button class="link" type="button" data-tab="products">изменить</button></p>
+      ${res.length ? groups.map(([n, title]) => {
+        const list = res.filter((m) => m.missing.length === n);
+        return list.length ? `<section class="pgroup-dishes"><h2 class="h2">${title} <span class="count">${list.length}</span></h2><div class="dishes" data-n="${n}"></div></section>` : '';
+      }).join('') : `<div class="empty"><p>Пока ничего не подходит. Отметьте ещё продукты — чем больше, тем больше блюд найдётся.</p></div>`}`;
+    for (const [n] of groups) {
+      const box = $(`.dishes[data-n="${n}"]`);
+      if (box) renderCards(box, res.filter((m) => m.missing.length === n), (m) => cardHtml(m.item, { missing: m.missing }));
+    }
+  };
+
+  const drawTab = () => {
+    $$('.pantry-tabs button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.tab === pantryUi.tab));
+    listIO?.disconnect();
+    if (pantryUi.tab === 'products') drawProducts(); else drawDishes();
+    counts();
+  };
+
+  view.addEventListener('click', onPantryClick);
+  function onPantryClick(e) {
+    const t = e.target.closest('[data-tab], [data-k], [data-s], [data-more], [data-scope]');
+    if (!t || !view.contains(t)) return;
+    if (t.dataset.tab) { pantryUi.tab = t.dataset.tab; drawTab(); return; }
+    if (t.dataset.more) { pantryUi.open.add(t.dataset.more); drawGroups(); return; }
+    if (t.dataset.scope) { pantryUi.scope = t.dataset.scope; drawDishes(); counts(); return; }
+    if (t.dataset.s) {
+      const k = t.dataset.s;
+      pantry.staples = pantry.staples.includes(k) ? pantry.staples.filter((x) => x !== k) : [...pantry.staples, k];
+      t.setAttribute('aria-pressed', pantry.staples.includes(k));
+      save(); drawHave(); counts();
+      return;
+    }
+    const k = t.dataset.k;
+    if (pantry.items.has(k)) pantry.items.delete(k); else pantry.items.add(k);
+    save(); drawHave(); drawGroups(); counts();
+  }
+  currentCleanup = () => { view.removeEventListener('click', onPantryClick); listIO?.disconnect(); listIO = null; };
+  drawTab();
+}
+
+// =====================================================================
+// Каналы: управление
+// =====================================================================
+function channelHtml(c) {
+  const st = c.stats;
+  const total = st.total - st.exists;
+  const finished = st.done + st.skipped + st.error;
+  const pct = total ? Math.round((finished / total) * 100) : 0;
+  const title = c.title || (c.scan_error ? 'Канал не найден' : 'Загружаю список видео…');
+  const sub = [];
+  if (c.subscribers) sub.push(`${fmtViews(c.subscribers)} подписчиков`);
+  sub.push(c.limit_n ? `${c.limit_n} самых популярных видео` : 'все видео');
+  if (st.listed && c.limit_n) sub.push(`всего на канале ${st.listed}`);
+  const state = c.scan_error ? `<div class="job-error">${esc(c.scan_error)}</div>`
+    : c.scanning ? '<div class="job-bar"><i></i></div>'
+      : `<div class="ch-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>
+       <div class="job-sub"><span><b>${st.recipes}</b> ${plural(st.recipes, ['рецепт', 'рецепта', 'рецептов'])}</span><span>обработано ${finished} из ${total}</span>${st.queued ? '<span>сейчас в работе</span>' : ''}${st.skipped ? `<span>без рецепта: ${st.skipped}</span>` : ''}${st.error ? `<span>ошибки: ${st.error}</span>` : ''}${st.exists ? `<span>уже были у вас: ${st.exists}</span>` : ''}</div>`;
+  return `<article class="panel channel" data-id="${c.id}" data-title="${esc(c.title || c.url)}">
+    <h3><span>${esc(title)}</span>${!c.enabled ? '<span class="pill">на паузе</span>' : ''}</h3>
+    <div class="job-sub">${sub.map((x) => `<span>${esc(x)}</span>`).join('')}</div>
+    ${state}
+    <div class="btn-row">
+      ${c.title ? `<a class="btn btn-sm" href="#/channels?author=${encodeURIComponent(c.title)}">${icon('book')}Рецепты</a>` : ''}
+      ${c.scan_error || c.scanning ? '' : `<button class="btn btn-sm" type="button" data-act="${c.enabled ? 'pause' : 'resume'}">${c.enabled ? 'Пауза' : 'Продолжить'}</button>`}
+      ${c.scanning ? '' : `<button class="btn btn-sm" type="button" data-act="rescan">${icon('refresh')}Обновить</button>`}
+      ${c.title ? `<button class="btn btn-sm" type="button" data-act="rename">${icon('edit')}Переименовать</button>` : ''}
+      <button class="btn btn-sm btn-danger" type="button" data-act="delete">${icon('trash')}Удалить</button>
+    </div>
+  </article>`;
+}
+
+async function renderChannels(seq = navSeq) {
+  view.innerHTML = `
+    <div class="topbar"><a class="round-btn" href="#/channels" aria-label="К рецептам каналов">${icon('back')}</a></div>
+    <header class="page-head"><h1 class="h1">Каналы YouTube</h1></header>
+    <p class="lead">Компьютер сам собирает рецепты с этих каналов — по одному видео, когда свободен от ваших ссылок. Новые видео проверяет раз в сутки.</p>
+    <div id="ch-status"></div>
+    <div class="channels" id="ch-list"><div class="skeleton"></div></div>
+    <form class="panel ch-add" id="ch-add" novalidate>
+      <h3>Добавить канал</h3>
+      <label class="field"><span>Ссылка на канал или на любое его видео</span>
+        <input class="input" name="url" type="url" inputmode="url" placeholder="https://www.youtube.com/@TanyaShpilko" autocomplete="off"></label>
+      <label class="field"><span>Сколько видео взять</span>
+        <select class="select" name="limit"><option value="150">150 самых популярных</option><option value="50">50 самых популярных</option><option value="">Все видео канала</option></select></label>
+      <p class="form-error" id="ch-err" hidden></p>
+      <button class="btn btn-primary" type="submit">${icon('plus')}Добавить канал</button>
+    </form>`;
+  const load = async () => {
+    let data;
+    try { data = await store.channels(); } catch (e) {
+      if (!isStale(seq)) {
+        $('#ch-list').innerHTML = `<div class="notice">${icon('warn')}<div><b>${e.offline ? 'Нет связи с компьютером' : 'Не удалось загрузить каналы'}</b><div class="small">${e.offline ? 'Каналами управляет компьютер — откройте этот экран, когда связь появится.' : esc(e.message)}</div></div></div>`;
+      }
+      return;
+    }
+    if (isStale(seq) || !$('#ch-list')) return;
+    const s = data.status;
+    $('#ch-status').innerHTML = s.backoff_until
+      ? `<div class="notice">${icon('warn')}<div><b>YouTube попросил подождать</b><div class="small">Сбор продолжится в ${esc(fmtTime(s.backoff_until))}. Ваши ссылки обрабатываются как обычно.</div></div></div>`
+      : s.active ? `<p class="crawl">${icon('refresh')}<span>Сейчас: ${esc(s.active.title || 'видео')} — ${esc(s.active.channel)}</span></p>` : '';
+    $('#ch-list').innerHTML = data.items.length ? data.items.map(channelHtml).join('')
+      : '<p class="muted">Каналов пока нет. Добавьте первый — например, ссылку на канал Тани Шпилько.</p>';
+  };
+  $('#ch-list').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    const card = b.closest('.channel');
+    const id = card.dataset.id;
+    try {
+      if (b.dataset.act === 'rename') {
+        const res = await openDialog(`
+          <h3>Название канала</h3>
+          <p class="small muted">Так канал будет подписан в приложении и у всех его рецептов.</p>
+          <form method="dialog" class="field" id="rename-form">
+            <input class="input" name="title" value="${esc(card.dataset.title)}" maxlength="100" autocomplete="off">
+            <div class="dialog-actions"><button class="btn" type="button" data-cancel>Отмена</button><button class="btn btn-primary" value="ok">Сохранить</button></div>
+          </form>`, (d) => { // Enter в поле — «Сохранить» (первая кнопка формы)
+          $('input', d).select();
+          $('[data-cancel]', d).addEventListener('click', () => d.close('cancel'));
+        });
+        const title = $('#rename-form input', dialog)?.value.trim();
+        if (res !== 'ok' || !title || title === card.dataset.title) return;
+        await store.renameChannel(id, title);
+        toast('Канал переименован — рецепты обновятся на телефонах при синхронизации', 3500);
+      } else if (b.dataset.act === 'delete') {
+        if (!(await confirmDialog('Удалить канал?', `Рецепты «${card.dataset.title}» исчезнут из раздела «Каналы». Те, что вы сохранили к себе, останутся.`, 'Удалить', true))) return;
+        await store.deleteChannel(id);
+        toast('Канал удалён');
+      } else {
+        await store.channelAction(id, b.dataset.act);
+        toast({ pause: 'Сбор с канала на паузе', resume: 'Сбор продолжается', rescan: 'Проверяю новые видео' }[b.dataset.act]);
+      }
+    } catch (err) { toast(err.message, 4000); }
+    load();
+  });
+  $('#ch-add').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const err = $('#ch-err');
+    err.hidden = true;
+    const url = form.url.value.trim();
+    if (!url) { err.textContent = 'Вставьте ссылку на канал'; err.hidden = false; return; }
+    try {
+      await store.addChannel(url, form.limit.value ? +form.limit.value : null);
+      form.url.value = '';
+      toast('Канал добавлен — загружаю список видео', 3500);
+      load();
+    } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  });
+  await load();
+  const timer = setInterval(load, 5000);
+  currentCleanup = () => clearInterval(timer);
 }
 
 // =====================================================================
@@ -333,7 +725,7 @@ async function renderRecipe(key, seq = navSeq) {
 
   view.innerHTML = `
     <div class="recipe-top">
-      <a class="round-btn" href="#/" aria-label="К рецептам">${icon('back')}</a>
+      <a class="round-btn" href="${esc(lastListHash)}" aria-label="Назад к списку">${icon('back')}</a>
       <div class="recipe-actions">
         <button class="round-btn" id="fav" aria-pressed="${!!r.favorite}" aria-label="${r.favorite ? 'Убрать из избранного' : 'В избранное'}">${icon(r.favorite ? 'heart-fill' : 'heart')}</button>
         <a class="round-btn" href="#/r/${esc(r.key)}/edit" aria-label="Изменить">${icon('edit')}</a>
@@ -345,8 +737,9 @@ async function renderRecipe(key, seq = navSeq) {
       <div class="hero-text">
         <h1 class="recipe-title">${esc(r.title)}</h1>
         ${r.description ? `<p class="lead">${esc(r.description)}</p>` : ''}
-        ${source || r.author ? `<p class="byline">${source}${r.author && !(r.source_name || '').includes(r.author) ? `<span>автор: ${esc(r.author)}</span>` : ''}</p>` : ''}
+        ${source || r.author ? `<p class="byline">${source}${r.author && !(r.source_name || '').includes(r.author) ? `<span>автор: ${esc(r.author)}</span>` : ''}${r.video_views ? `<span>${esc(fmtViews(r.video_views))} просмотров${r.video_date ? ` · ${esc(r.video_date.slice(0, 4))}` : ''}</span>` : ''}${r.channel_id && r.author ? `<a href="#/channels?author=${encodeURIComponent(r.author)}">все рецепты канала</a>` : ''}</p>` : ''}
         ${facts.length ? `<div class="facts">${facts.join('')}</div>` : ''}
+        ${r.channel_id ? `<button class="btn btn-big btn-save" id="save" type="button" aria-pressed="${!!r.saved}"></button>` : ''}
         ${steps.length ? `<button class="btn btn-primary btn-big btn-cook" id="cook" type="button">${icon('play')}Готовить по шагам</button>` : ''}
         ${(r.categories || []).length || (r.tags || []).length ? `<div class="tags">${(r.categories || []).map((c) => `<span class="tag cat">${esc(c)}</span>`).join('')}${(r.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
       </div>
@@ -449,6 +842,25 @@ async function renderRecipe(key, seq = navSeq) {
       toast(value ? 'Добавлено в избранное' : 'Убрано из избранного');
     } catch (e) { toast(e.message); }
   });
+
+  // Рецепт канала: «Сохранить к себе» — и он появится в «Рецептах» (в «Каналах» тоже останется).
+  const saveBtn = $('#save');
+  const drawSave = () => {
+    saveBtn.setAttribute('aria-pressed', !!r.saved);
+    saveBtn.innerHTML = r.saved ? `${icon('check')}В моих рецептах` : `${icon('plus')}Сохранить к себе`;
+  };
+  if (saveBtn) {
+    drawSave();
+    saveBtn.addEventListener('click', async () => {
+      const value = !r.saved;
+      try {
+        await store.setSaved(r.key, value);
+        r.saved = value;
+        drawSave();
+        toast(value ? 'Сохранено в ваши рецепты' : 'Убрано из ваших рецептов, в «Каналах» рецепт остался');
+      } catch (e) { toast(e.message); }
+    });
+  }
 
   $('#more').addEventListener('click', () => recipeMenu(r));
 
@@ -663,7 +1075,7 @@ async function recipeMenu(r) {
     </form>`);
   if (res === 'delete') {
     if (await confirmDialog('Удалить рецепт?', `«${r.title}» исчезнет из коллекции${DEVICE ? ' на телефоне и на компьютере' : ''}. Это действие нельзя отменить.`, 'Удалить', true)) {
-      try { await store.deleteRecipe(r.key); toast('Рецепт удалён'); location.hash = '#/'; }
+      try { await store.deleteRecipe(r.key); toast('Рецепт удалён'); location.hash = lastListHash; }
       catch (e) { toast(e.message); }
     }
   } else if (res === 'reprocess') {
@@ -1985,7 +2397,7 @@ async function start() {
       if (t === 'outbox' || t === 'synced') refreshBadge();
       if (t === 'synced' && ev.data.changed) {
         const { path } = parseHash();
-        if (path === '/' || path === '') loadList().catch(() => {});
+        if (path === '/' || path === '' || path === '/channels') reloadList().catch(() => {});
       }
       if (t === 'image') hydrateImages();
       if (t === 'auth') toast('Компьютер отключил этот телефон — подключите его заново', 5000);

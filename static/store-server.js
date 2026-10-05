@@ -23,19 +23,23 @@ async function api(path, { method = 'GET', body, text = false } = {}) {
 
 const withKey = (r) => (r ? { ...r, key: String(r.id) } : r);
 
+// «Есть дома» на ПК хранится в этом браузере.
+function readLocal(k, fallback) {
+  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+}
+function writeLocal(k, v) {
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* приватный режим — не запоминаем */ }
+}
+
 export const serverStore = {
   mode: 'server',
   api,
   refreshCatalog: (chain) => api(`api/grocery/catalog/${chain}/refresh`, { method: 'POST' }),
   async init() {},
   imageUrl: async (name) => (name ? `images/${name}` : null),
-  async listRecipes({ q, category, favorite, review }) {
-    const qs = new URLSearchParams();
-    if (q) qs.set('q', q);
-    if (category) qs.set('category', category);
-    if (favorite) qs.set('favorite', 'true');
-    if (review) qs.set('review', 'true');
-    const data = await api('api/recipes?' + qs);
+  // Все краткие карточки раздела: поиск, фильтры и сортировку делает listing.js.
+  async listRecipes({ collection = 'mine' } = {}) {
+    const data = await api('api/recipes?collection=' + encodeURIComponent(collection));
     return { ...data, items: data.items.map(withKey) };
   },
   async getRecipe(key) {
@@ -45,6 +49,14 @@ export const serverStore = {
   source: (key) => api(`api/recipes/${key}/source`, { text: true }),
   saveRecipe: async (key, body) => withKey((await api(`api/recipes/${key}`, { method: 'PUT', body })).recipe),
   setFavorite: (key, favorite) => api(`api/recipes/${key}/favorite`, { method: 'POST', body: { favorite } }),
+  setSaved: (key, saved) => api(`api/recipes/${key}/saved`, { method: 'POST', body: { saved } }),
+  async getPantry() { return readLocal('pantry', null); },
+  async setPantry(value) { writeLocal('pantry', value); },
+  channels: () => api('api/channels'),
+  addChannel: (url, limit) => api('api/channels', { method: 'POST', body: { url, limit } }),
+  channelAction: (id, action) => api(`api/channels/${id}/${action}`, { method: 'POST' }),
+  deleteChannel: (id) => api(`api/channels/${id}`, { method: 'DELETE' }),
+  renameChannel: (id, title) => api(`api/channels/${id}/rename`, { method: 'POST', body: { title } }),
   deleteRecipe: (key) => api(`api/recipes/${key}`, { method: 'DELETE' }),
   reprocess: (key) => api(`api/recipes/${key}/reprocess`, { method: 'POST' }),
   addJob: (body) => api('api/jobs', { method: 'POST', body }),

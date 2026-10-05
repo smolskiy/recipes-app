@@ -1,6 +1,7 @@
 // Режим телефона: рецепты хранятся на телефоне, ПК — только обработка и резервная копия.
 
 import * as core from './sync-core.js';
+import { inCollection } from './listing.js';
 
 const STATUS_LABELS = {
   pending: 'Ждёт связи с компьютером', queued: 'В очереди', downloading: 'Загрузка', transcribing: 'Распознавание',
@@ -11,12 +12,6 @@ const CATEGORIES = ['Завтраки', 'Супы', 'Салаты', 'Закус�
   'Напитки', 'Соусы', 'Заготовки', 'Детское меню'];
 
 const imageCache = new Map();
-const norm = (s) => (s || '').toLowerCase().replace(/ё/g, 'е');
-
-function searchText(r) {
-  return norm([r.title, r.description, r.author, r.source_name, ...(r.ingredients || []).map((i) => i.name),
-    ...(r.tags || []), ...(r.categories || [])].join(' '));
-}
 
 function summary(r) {
   return {
@@ -24,12 +19,52 @@ function summary(r) {
     tags: r.tags || [], favorite: !!r.favorite, needs_review: !!r.needs_review, image: r.image,
     source_kind: r.source_kind, source_name: r.source_name,
     total_time_min: r.total_time_min || ((r.prep_time_min || 0) + (r.cook_time_min || 0)) || null,
-    servings: r.servings, created_at: r.created_at,
+    servings: r.servings, created_at: r.created_at, author: r.author,
+    ingredients: (r.ingredients || []).map((i) => ({ name: i.name, shop_query: i.shop_query, note: i.note })),
+    ingredients_count: (r.ingredients || []).length,
+    channel_id: r.channel_id || null, saved: !!r.saved, video_views: r.video_views || null, video_date: r.video_date || null,
   };
 }
 
-async function liveRecipes() {
-  return (await core.dbAll('recipes')).filter((r) => !r._deleted);
+// Все рецепты в памяти: с каналами их сотни, а список и «Есть дома» перечитывают их при каждом открытии.
+// Сбрасывается при синхронизации с изменениями и при своих правках.
+let recipesCache = null;
+function invalidate() { recipesCache = null; }
+function onSyncMessage(ev) {
+  const t = ev.data?.type;
+  if (t === 'synced' && ev.data.changed) invalidate();
+  if (t === 'synced') imgPending.clear(); // неудачные картинки — ещё раз после новой синхронизации
+}
+core.events.addEventListener('message', onSyncMessage);
+core.channel?.addEventListener('message', onSyncMessage);
+
+function liveRecipes() {
+  if (!recipesCache) {
+    recipesCache = core.dbAll('recipes').then((all) => all.filter((r) => !r._deleted));
+    recipesCache.catch(() => { recipesCache = null; });
+  }
+  return recipesCache;
+}
+
+// Картинки, которых ещё нет на телефоне (их докачивает синхронизация), — сразу для видимых карточек.
+const imgQueue = [];
+const imgPending = new Set();
+let imgActive = 0;
+async function pumpImages() {
+  if (imgActive >= 3 || !imgQueue.length) return;
+  const conn = await core.kv.get('conn');
+  if (conn?.state !== 'lan' && conn?.state !== 'wan') { imgQueue.length = 0; return; }
+  while (imgActive < 3 && imgQueue.length) {
+    const name = imgQueue.shift();
+    imgActive++;
+    core.fetchImage(name).catch(() => {}).finally(() => { imgActive--; pumpImages(); });
+  }
+}
+function fetchLater(name) {
+  if (imgPending.has(name)) return;
+  imgPending.add(name);
+  imgQueue.push(name);
+  pumpImages();
 }
 
 let syncTimer = null;
@@ -75,24 +110,15 @@ export const deviceStore = {
     if (!name) return null;
     if (imageCache.has(name)) return imageCache.get(name);
     const row = await core.dbGet('images', name);
-    if (!row) return null;
+    if (!row) { fetchLater(name); return null; }
     const url = URL.createObjectURL(row.blob);
     imageCache.set(name, url);
     return url;
   },
-  async listRecipes({ q, category, favorite, review }) {
-    let items = await liveRecipes();
-    const counts = {};
-    items.forEach((r) => (r.categories || []).forEach((c) => (counts[c] = (counts[c] || 0) + 1)));
-    if (q) {
-      const words = norm(q).match(/[\p{L}\p{N}]+/gu) || [];
-      items = items.filter((r) => { const t = searchText(r); return words.every((w) => t.includes(w)); });
-    }
-    if (category) items = items.filter((r) => (r.categories || []).includes(category));
-    if (favorite) items = items.filter((r) => r.favorite);
-    if (review) items = items.filter((r) => r.needs_review);
-    items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    return { items: items.map(summary), categories: CATEGORIES, category_counts: counts };
+  // Все краткие карточки раздела: поиск, фильтры и сортировку делает listing.js.
+  async listRecipes({ collection = 'mine' } = {}) {
+    const items = (await liveRecipes()).filter((r) => inCollection(r, collection));
+    return { items: items.map(summary), categories: CATEGORIES };
   },
   async getRecipe(key) {
     const r = await core.dbGet('recipes', key);
@@ -113,6 +139,7 @@ export const deviceStore = {
     const r = await core.dbGet('recipes', key);
     const next = { ...r, ...body, uid: key, updated_at: new Date().toISOString(), _dirty: 1 };
     await core.dbPut('recipes', next);
+    invalidate();
     scheduleSync();
     return { ...next, key };
   },
@@ -121,6 +148,15 @@ export const deviceStore = {
     if (!r) return;
     Object.assign(r, { favorite, updated_at: new Date().toISOString(), _dirty: 1 });
     await core.dbPut('recipes', r);
+    invalidate();
+    scheduleSync();
+  },
+  async setSaved(key, saved) {
+    const r = await core.dbGet('recipes', key);
+    if (!r) return;
+    Object.assign(r, { saved, updated_at: new Date().toISOString(), _dirty: 1 });
+    await core.dbPut('recipes', r);
+    invalidate();
     scheduleSync();
   },
   async deleteRecipe(key) {
@@ -128,8 +164,16 @@ export const deviceStore = {
     if (!r) return;
     Object.assign(r, { _deleted: true, updated_at: new Date().toISOString(), _dirty: 1 });
     await core.dbPut('recipes', r);
+    invalidate();
     scheduleSync();
   },
+  getPantry: () => core.kv.get('pantry', null),
+  setPantry: (value) => core.kv.set('pantry', value),
+  channels: () => online(() => core.api('/api/channels', { timeout: 15000 })),
+  addChannel: (url, limit) => online(() => core.api('/api/channels', { method: 'POST', body: { url, limit } })),
+  channelAction: (id, action) => online(() => core.api(`/api/channels/${id}/${action}`, { method: 'POST' })),
+  deleteChannel: (id) => online(() => core.api(`/api/channels/${id}`, { method: 'DELETE', timeout: 60000 })),
+  renameChannel: (id, title) => online(() => core.api(`/api/channels/${id}/rename`, { method: 'POST', body: { title }, timeout: 60000 })),
   reprocess: (key) => online(() => core.api(`/api/device/recipes/${key}/reprocess`, { method: 'POST' })),
   async addJob(body) {
     const item = await core.enqueue(body);
