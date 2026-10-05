@@ -76,4 +76,8 @@ export const serverStore = {
   revokeDevice: (id) => api(`api/devices/${id}`, { method: 'DELETE' }),
   net: () => api('api/net'),
   setNet: (body) => api('api/net', { method: 'PUT', body }),
+  cloud: () => api('api/cloud'),
+  setCloud: (body) => api('api/cloud', { method: 'PUT', body }),
+  cloudUpload: () => api('api/cloud/upload', { method: 'POST' }),
+  cloudDisconnect: () => api('api/cloud', { method: 'DELETE' }),
 };

@@ -73,9 +73,20 @@ async function candidates() {
   (eps.lan || []).forEach((u) => add(u, 'lan'));
   (eps.http_lan || []).forEach((u) => add(u, 'lan'));
   (eps.wan || []).forEach((u) => add(u, 'wan'));
-  // Домашние адреса пробуем раньше внешнего.
-  list.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'lan' ? -1 : 1));
   return list;
+}
+
+// Порядок групп: приложение с ПК или APK — сначала дом; приложение с GitHub Pages — сначала интернет
+// (домашний адрес с публичной страницы вызывает запрос разрешения на доступ к локальной сети).
+async function groups(list) {
+  const lanFirst = NATIVE || (await kv.get('originIsPc', false));
+  const last = await kv.get('lastEndpoint');
+  const lan = list.filter((e) => e.kind === 'lan');
+  const wan = list.filter((e) => e.kind === 'wan');
+  const out = [];
+  if (last) out.push(list.filter((e) => e.url === last.url));
+  out.push(...(lanFirst ? [lan, wan] : [wan, lan]));
+  return out.filter((g) => g.length);
 }
 
 let current = null; // { url, kind, at }
@@ -94,16 +105,21 @@ export async function connect(force = false) {
   if (!token) throw new AuthError('Приложение ещё не подключено к компьютеру');
   if (!force && current && Date.now() - current.at < 60000) return current;
   const list = await candidates();
-  const results = await Promise.allSettled(list.map((ep) => probe(ep, token)));
-  const auth = results.find((r) => r.status === 'rejected' && r.reason instanceof AuthError);
-  const okIndex = results.findIndex((r) => r.status === 'fulfilled');
-  if (okIndex < 0) {
+  let found = null;
+  let authErr = null;
+  for (const group of await groups(list)) {
+    const results = await Promise.allSettled(group.map((ep) => probe(ep, token)));
+    authErr ||= results.find((r) => r.status === 'rejected' && r.reason instanceof AuthError)?.reason;
+    const ok = results.findIndex((r) => r.status === 'fulfilled');
+    if (ok >= 0) { found = group[ok]; break; }
+  }
+  if (!found) {
     current = null;
     await setConn({ state: 'offline', tried: list.map((e) => e.url) });
-    if (auth) throw auth.reason;
+    if (authErr) throw authErr;
     throw new OfflineError('Нет связи с домашним компьютером');
   }
-  current = { ...list[okIndex], at: Date.now() };
+  current = { ...found, at: Date.now() };
   await kv.set('lastEndpoint', { url: current.url, kind: current.kind });
   await setConn({ state: current.kind, endpoint: current.url });
   return current;

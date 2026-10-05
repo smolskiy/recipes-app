@@ -896,10 +896,58 @@ window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); inst
 async function renderSystem() {
   if (DEVICE) return renderDeviceSystem();
   view.innerHTML = `<header class="page-head"><h1 class="h1">Система</h1></header><div class="sys-grid" id="sys"><div class="skeleton"></div><div class="skeleton"></div></div>`;
-  const [s, g, devs, net] = await Promise.all([store.system(), store.chains(), store.devices(), store.net().catch(() => null)]);
-  $('#sys').innerHTML = phonesPanel(devs.items, net) + netPanel(net) + systemPanels(s, g);
+  const [s, g, devs, net, cloud] = await Promise.all([store.system(), store.chains(), store.devices(),
+    store.net().catch(() => null), store.cloud().catch(() => null)]);
+  $('#sys').innerHTML = phonesPanel(devs.items, net) + netPanel(net) + cloudPanel(cloud) + systemPanels(s, g);
   bindSystemPanels(g);
   bindPhonePanels();
+  bindCloudPanel();
+}
+
+function cloudPanel(c) {
+  if (!c) return '';
+  const last = c.last_upload;
+  let body;
+  if (c.configured) {
+    body = `<dl class="kv"><dt>Аккаунт</dt><dd>${esc(c.user || 'подключён')}</dd><dt>Папка</dt><dd>${esc(c.folder)}</dd>
+      <dt>Последняя копия</dt><dd>${last ? `${esc(fmtDate(last.time))}, ${last.size_kb} КБ` : 'ещё не было'}</dd></dl>
+      ${c.last_error ? `<p class="form-error">${esc(c.last_error)}</p>` : ''}
+      <div class="btn-row"><button class="btn btn-primary" id="cloud-upload">Отправить копию сейчас</button>
+      <button class="btn btn-ghost" id="cloud-off">Отключить</button></div>`;
+  } else if (!c.client_id) {
+    body = `<p class="small" style="margin:0">Укажите Client ID приложения из oauth.yandex.ru (с правом «Доступ к папке приложения на Диске» и Redirect URI https://oauth.yandex.ru/verification_code).</p>
+      <form id="cloud-cid" class="add-row"><input class="input" name="cid" placeholder="Client ID" autocomplete="off"><button class="btn" type="submit">Сохранить</button></form>`;
+  } else {
+    body = `<ol class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">
+        <li>Нажмите «Войти в Яндекс» и разрешите доступ.</li>
+        <li>Яндекс покажет токен — скопируйте его и вставьте ниже.</li></ol>
+      <a class="btn" href="${esc(c.auth_url)}" target="_blank" rel="noopener noreferrer" style="justify-self:start">Войти в Яндекс</a>
+      <form id="cloud-token" class="add-row"><input class="input" name="token" placeholder="Токен со страницы Яндекса" autocomplete="off"><button class="btn btn-primary" type="submit">Подключить</button></form>`;
+  }
+  return `<section class="panel"><h3>Копии в Яндекс Диск ${c.configured ? '<span class="ok">включены</span>' : ''}</h3>
+    <p class="small muted" style="margin:0">Раз в сутки копия базы рецептов с картинками уходит на Диск, хранятся последние 30. Токен хранится только на этом компьютере.</p>
+    ${body}<p class="form-error" id="cloud-err" hidden></p></section>`;
+}
+
+function bindCloudPanel() {
+  const fail = (e) => { const el = $('#cloud-err'); if (el) { el.textContent = e.message; el.hidden = false; } };
+  $('#cloud-cid')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await store.setCloud({ client_id: e.target.cid.value.trim() }); renderSystem(); } catch (ex) { fail(ex); }
+  });
+  $('#cloud-token')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await store.setCloud({ token: e.target.token.value.trim() }); toast('Яндекс Диск подключён'); renderSystem(); } catch (ex) { fail(ex); }
+  });
+  $('#cloud-upload')?.addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = 'Отправляю…';
+    try { await store.cloudUpload(); toast('Копия отправлена в Яндекс Диск'); renderSystem(); }
+    catch (ex) { fail(ex); e.target.disabled = false; e.target.textContent = 'Отправить копию сейчас'; }
+  });
+  $('#cloud-off')?.addEventListener('click', async () => {
+    if (!(await confirmDialog('Отключить Яндекс Диск?', 'Новые копии перестанут отправляться. Уже отправленные останутся на Диске.', 'Отключить'))) return;
+    await store.cloudDisconnect(); renderSystem();
+  });
 }
 
 function phonesPanel(devices, net) {
@@ -916,17 +964,31 @@ function phonesPanel(devices, net) {
 function netPanel(net) {
   if (!net) return '';
   const t = net.tls;
-  return `<section class="panel"><h3>Внешний доступ</h3>
-    <p class="small" style="margin:0">Чтобы приложение работало вне дома: укажите статический IP и пробросьте порт на роутере на ${esc(net.lan_ips[0] || 'этот компьютер')}:${net.https_port}.</p>
+  const a = net.acme || {};
+  const pc = net.lan_ips[0] || 'этот компьютер';
+  return `<section class="panel wide"><h3>Доступ из интернета</h3>
+    <p class="small" style="margin:0">Чтобы приложение отправляло ссылки и вне дома, на роутере пробросьте два порта на ${esc(pc)}:
+      внешний <b>${esc(net.public_port)}</b> → ${esc(net.wan_port)} (приложение) и внешний <b>80</b> → 80 (проверка сертификата Let's Encrypt).
+      Удобнее всего закрепить за компьютером адрес ${esc(pc)} в настройках DHCP роутера.</p>
     <form id="net-form" style="display:grid;gap:8px">
-      <label class="field"><span>Внешний адрес (статический IP или домен)</span><input class="input" name="host" value="${esc(net.public_host)}" placeholder="например 203.0.113.10"></label>
-      <label class="field"><span>Внешний порт на роутере</span><input class="input" name="port" inputmode="numeric" value="${esc(net.public_port)}"></label>
+      <div class="edit-grid-2">
+        <label class="field"><span>Статический IP (от провайдера)</span><input class="input" name="host" value="${esc(net.public_host)}" placeholder="например 203.0.113.10"></label>
+        <label class="field"><span>Внешний порт на роутере</span><input class="input" name="port" inputmode="numeric" value="${esc(net.public_port)}"></label>
+      </div>
+      <label class="field"><span>Адрес приложения для телефона</span><input class="input" name="app" value="${esc(net.app_url || '')}" placeholder="https://…/recipes-app/"></label>
       <button class="btn" type="submit" style="justify-self:start">Сохранить</button>
       <p class="form-error" id="net-err" hidden></p>
     </form>
     <dl class="kv"><dt>Дома</dt><dd>${esc(net.endpoints.lan.join(', ') || '—')}</dd>
       <dt>Из интернета</dt><dd>${esc(net.endpoints.wan.join(', ') || 'не настроено')}</dd>
-      ${t ? `<dt>Сертификат до</dt><dd>${esc(fmtDate(t.valid_until))}</dd><dt>Отпечаток</dt><dd style="font-size:11px">${esc(t.ca_fingerprint.slice(0, 29))}…</dd>` : ''}</dl></section>`;
+      <dt>Сертификат Let's Encrypt</dt><dd>${a.valid_until ? `<span class="ok">до ${esc(fmtDate(a.valid_until))}</span>, продлевается сам` : '<span class="bad">нет</span>'}</dd>
+      ${a.last_error ? `<dt>Последняя ошибка</dt><dd class="bad">${esc(a.last_error)}</dd>` : ''}
+      ${t ? `<dt>Свой сертификат (дом)</dt><dd>до ${esc(fmtDate(t.valid_until))}</dd>` : ''}</dl>
+    ${net.public_host ? `<form id="acme-form" style="display:grid;gap:8px">
+      <label class="check small"><input type="checkbox" name="agree"> Я принимаю <a href="${esc(a.terms_url)}" target="_blank" rel="noopener noreferrer">соглашение подписчика Let's Encrypt</a></label>
+      <label class="field"><span>Почта для уведомлений Let's Encrypt (необязательно)</span><input class="input" name="email" type="email" autocomplete="email"></label>
+      <button class="btn btn-primary" type="submit" style="justify-self:start">${a.valid_until ? 'Обновить сертификат' : 'Получить сертификат'}</button>
+      <p class="form-error" id="acme-err" hidden></p></form>` : ''}</section>`;
 }
 
 function bindPhonePanels() {
@@ -942,10 +1004,27 @@ function bindPhonePanels() {
     const err = $('#net-err');
     err.hidden = true;
     try {
-      const res = await store.setNet({ public_host: e.target.host.value.trim(), public_port: +e.target.port.value || 0 });
-      toast(res.ca_changed ? 'Сохранено. Сертификат обновлён — его нужно заново установить на телефон.' : 'Сохранено', 5000);
+      const res = await store.setNet({ public_host: e.target.host.value.trim(), public_port: +e.target.port.value || 0,
+        app_url: e.target.app.value.trim() });
+      toast(res.ca_changed ? 'Сохранено. Домашний сертификат обновлён — если он был установлен на телефон, установите заново.' : 'Сохранено', 5000);
       renderSystem();
     } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  });
+  $('#acme-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = $('#acme-err');
+    err.hidden = true;
+    const btn = $('button[type=submit]', e.target);
+    btn.disabled = true;
+    btn.textContent = 'Получаю сертификат…';
+    try {
+      await store.api('api/acme', { method: 'POST', body: { agree: e.target.agree.checked, email: e.target.email.value.trim() || null } });
+      toast('Сертификат получен');
+      renderSystem();
+    } catch (ex) {
+      err.textContent = ex.message; err.hidden = false;
+      btn.disabled = false; btn.textContent = 'Получить сертификат';
+    }
   });
 }
 
