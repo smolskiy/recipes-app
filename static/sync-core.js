@@ -416,6 +416,15 @@ async function fetchMissingImages() {
   }
 }
 
+// Адреса компьютера (внешний IP, порт на роутере) могут поменяться — телефон узнаёт их заново
+// раз в полчаса, пока связь есть, и подключать его повторно не нужно.
+async function refreshEndpoints() {
+  if (Date.now() - (await kv.get('endpointsAt', 0)) < 30 * 60 * 1000) return;
+  const info = await api('/api/device/info');
+  if (info?.endpoints) await kv.set('endpoints', info.endpoints);
+  await kv.set('endpointsAt', Date.now());
+}
+
 // ---------- Полная синхронизация ----------
 let running = null;
 export function syncAll(reason = '') {
@@ -426,6 +435,7 @@ export function syncAll(reason = '') {
       // телефона синхронизация так и возвращала бы «не подключено» до перезапуска приложения.
       if (!(await kv.get('token'))) return { ok: false, state: 'unpaired' };
       await connect();
+      await refreshEndpoints().catch(() => {});
       await sendOutbox();
       await pushChanges();
       await refreshJobs();

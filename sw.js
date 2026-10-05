@@ -5,7 +5,7 @@
 
 import { enqueue, extractUrl, syncAll } from './static/sync-core.js';
 
-const VERSION = '506e15109168';
+const VERSION = '131101a8502d';
 const CACHE = `recipes-shell-${VERSION}`;
 const SHELL = [
   './', 'manifest.webmanifest',
