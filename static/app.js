@@ -155,7 +155,7 @@ const queueText = (n) => `${n} ${plural(n, ['ссылка ждёт', 'ссылк
 // Строка состояния над меню: видна всегда, чтобы было понятно, доступен ли компьютер прямо сейчас.
 async function renderConn() {
   if (!DEVICE) return;
-  const c = await store.connection();
+  const c = await store.connection({ lite: true });
   const state = connState(c);
   const navItem = document.querySelector('[data-nav="system"]');
   navItem.dataset.conn = state === 'auth' ? 'unpaired' : state;
@@ -181,30 +181,44 @@ async function renderConn() {
 
 // ---------- Маршрутизация ----------
 let currentCleanup = null;
+// Номер текущего перехода: страница, которая дождалась ответа уже после ухода на другую вкладку,
+// ничего не рисует (иначе поздний ответ компьютера «перебрасывал» бы на старую вкладку).
+let navSeq = 0;
+const isStale = (seq) => seq !== navSeq;
+
 async function route() {
   closeCook?.();
   currentCleanup?.();
   currentCleanup = null;
+  const seq = ++navSeq;
   const { path, params } = parseHash();
   const parts = path.split('/').filter(Boolean);
   document.body.dataset.route = parts[0] || 'list';
-  let nav = 'list';
+  const nav = parts[0] === 'add' ? 'add' : ['system', 'pair', 'phone'].includes(parts[0]) ? 'system' : 'list';
+  // Вкладка подсвечивается сразу, а если страница готовится дольше мгновения — сверху бежит полоска.
+  $$('.nav-item').forEach((a) => (a.dataset.nav === nav ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
+  const slow = setTimeout(() => { if (!isStale(seq)) document.body.classList.add('routing'); }, 250);
   try {
     if (DEVICE && parts[0] !== 'pair' && !(await store.paired())) {
-      location.replace('#/pair');
+      if (!isStale(seq)) location.replace('#/pair');
       return;
     }
-    if (parts[0] === 'r' && parts[1] && parts[2] === 'edit') await renderEdit(parts[1]);
-    else if (parts[0] === 'r' && parts[1]) await renderRecipe(parts[1]);
-    else if (parts[0] === 'add') { nav = 'add'; await renderAdd(params); }
-    else if (parts[0] === 'system') { nav = 'system'; await renderSystem(); }
-    else if (parts[0] === 'pair' && DEVICE) { nav = 'system'; await renderPair(params); }
-    else if (parts[0] === 'phone' && !DEVICE) { nav = 'system'; await renderPhoneSetup(); }
+    if (isStale(seq)) return;
+    if (parts[0] === 'r' && parts[1] && parts[2] === 'edit') await renderEdit(parts[1], seq);
+    else if (parts[0] === 'r' && parts[1]) await renderRecipe(parts[1], seq);
+    else if (parts[0] === 'add') await renderAdd(params);
+    else if (parts[0] === 'system') await renderSystem(seq);
+    else if (parts[0] === 'pair' && DEVICE) await renderPair(params, seq);
+    else if (parts[0] === 'phone' && !DEVICE) await renderPhoneSetup(seq);
     else await renderList(params);
   } catch (e) {
-    view.innerHTML = `<div class="notice error">${icon('warn')}<div><b>Не удалось открыть страницу</b><div class="small">${esc(e.message)}</div></div></div>`;
+    if (!isStale(seq)) {
+      view.innerHTML = `<div class="notice error">${icon('warn')}<div><b>Не удалось открыть страницу</b><div class="small">${esc(e.message)}</div></div></div>`;
+    }
+  } finally {
+    clearTimeout(slow);
+    if (!isStale(seq)) document.body.classList.remove('routing');
   }
-  $$('.nav-item').forEach((a) => (a.dataset.nav === nav ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
 }
 window.addEventListener('hashchange', () => { route(); window.scrollTo(0, 0); });
 
@@ -296,8 +310,9 @@ function cardHtml(r) {
 // =====================================================================
 // Рецепт
 // =====================================================================
-async function renderRecipe(key) {
+async function renderRecipe(key, seq = navSeq) {
   const { recipe: r } = await store.getRecipe(key);
+  if (isStale(seq)) return;
   let scale = 1;
   const baseServ = r.servings;
   const checked = new Set(); // отмеченные ингредиенты — общие для страницы и режима готовки
@@ -445,7 +460,7 @@ async function renderRecipe(key) {
   });
 
   const shop = receipt(r);
-  await shop.init();
+  shop.init().catch(() => {}); // цены — с компьютера; страница рецепта их не ждёт
 }
 
 function ingListHtml(ingredients, scale, checked) {
@@ -854,7 +869,7 @@ async function chooseStore(chain, onDone) {
 // =====================================================================
 let addMode = 'url';
 async function renderAdd(params) {
-  const limits = await store.limits().catch(() => null);
+  const limitsReady = store.limits().catch(() => null); // с компьютера — не ждём, подставим позже
   const preset = params.get('url') || '';
   // Из закладки «В рецепты»: текст открытой в браузере страницы и её адрес.
   const presetText = params.get('text') || '';
@@ -890,17 +905,23 @@ async function renderAdd(params) {
           + 'Без связи с компьютером ссылка подождёт в очереди и уйдёт сама.'
         : 'Рецепт разбирает этот компьютер, обычно за 1–3 минуты.'}</p>
       <details class="limits"><summary>Сайт «пускает только браузеры»?</summary>${browserOnlyHelp()}</details>
-      ${limits ? `<details class="limits"><summary>Ограничения</summary><ul>
-        <li>Видео до ${limits.max_video_minutes} минут — у более длинных используются только описание и субтитры.</li>
-        <li>Аудио до ${limits.max_audio_mb} МБ, видео для чтения кадров до ${limits.max_video_mb} МБ, не больше ${limits.max_frames} кадров.</li>
-        <li>Страница сайта до ${limits.max_page_mb} МБ, текст до ${limits.max_text_chars.toLocaleString('ru-RU')} символов.</li>
-        <li>Одно задание обрабатывается не дольше ${limits.job_timeout_min} минут, при сбое сети — до ${limits.max_attempts} попыток.</li>
-        <li>Ссылки на домашнюю сеть и служебные адреса не принимаются.</li></ul></details>` : ''}
+      <details class="limits" id="limits" hidden><summary>Ограничения</summary><ul></ul></details>
     </form>
     <h2 class="h2 jobs-head">Очередь и история</h2>
     <div class="jobs" id="jobs"></div>`;
 
   const form = $('#add-form');
+  limitsReady.then((limits) => {
+    const box = $('#limits');
+    if (!limits || !box) return;
+    $('ul', box).innerHTML = `
+      <li>Видео до ${limits.max_video_minutes} минут — у более длинных используются только описание и субтитры.</li>
+      <li>Аудио до ${limits.max_audio_mb} МБ, видео для чтения кадров до ${limits.max_video_mb} МБ, не больше ${limits.max_frames} кадров.</li>
+      <li>Страница сайта до ${limits.max_page_mb} МБ, текст до ${limits.max_text_chars.toLocaleString('ru-RU')} символов.</li>
+      <li>Одно задание обрабатывается не дольше ${limits.job_timeout_min} минут, при сбое сети — до ${limits.max_attempts} попыток.</li>
+      <li>Ссылки на домашнюю сеть и служебные адреса не принимаются.</li>`;
+    box.hidden = false;
+  });
   if (presetSrc) form.dataset.src = presetSrc;
   $('.bookmarklet')?.addEventListener('click', (e) => { e.preventDefault(); toast('Перетащите кнопку на панель закладок браузера', 3500); });
   $$('.seg button', form).forEach((b) => b.addEventListener('click', () => {
@@ -1034,8 +1055,9 @@ document.addEventListener('click', async (e) => {
 // =====================================================================
 // Редактирование
 // =====================================================================
-async function renderEdit(key) {
+async function renderEdit(key, seq = navSeq) {
   const { recipe: r } = await store.getRecipe(key);
+  if (isStale(seq)) return;
   const num = (v) => (v == null ? '' : String(v).replace('.', ','));
   const ingRow = (i = {}) => `<div class="ing-row">
       <input class="input" name="i_name" placeholder="Продукт" value="${esc(i.name || '')}" aria-label="Продукт">
@@ -1254,7 +1276,7 @@ async function scanQr() {
 
 const pairHead = (title) => `<header class="page-head"><h1 class="h1">${esc(title)}</h1></header>`;
 
-async function renderPair(params) {
+async function renderPair(params, seq = navSeq) {
   const paired = await store.paired();
   let code = params.get('code') || '';
   let pc = params.get('pc') || (ORIGIN_IS_PC ? location.origin : '');
@@ -1275,10 +1297,10 @@ async function renderPair(params) {
     view.innerHTML = `${pairHead('Подключение')}<section class="panel pair-wait"><span class="spinner" aria-hidden="true"></span><p>Подключаю к домашнему компьютеру…</p></section>`;
     try {
       await doPair(pc, code);
-      renderPaired();
+      if (!isStale(seq)) renderPaired();
     } catch (e) {
       if (fromHandoff) clearHandoff();
-      renderPairForm({ pc, code: fromHandoff ? '' : code, error: friendlyPairError(e) });
+      if (!isStale(seq)) renderPairForm({ pc, code: fromHandoff ? '' : code, error: friendlyPairError(e) });
     }
     return;
   }
@@ -1386,11 +1408,12 @@ window.addEventListener('beforeinstallprompt', (e) => {
 });
 window.addEventListener('appinstalled', () => { installEvent = null; $('#install')?.setAttribute('hidden', ''); toast('Приложение установлено — оно на главном экране'); });
 
-async function renderSystem() {
-  if (DEVICE) return renderDeviceSystem();
+async function renderSystem(seq = navSeq) {
+  if (DEVICE) return renderDeviceSystem(seq);
   view.innerHTML = `<header class="page-head"><h1 class="h1">Система</h1><a class="btn btn-sm" href="instruction" target="_blank" rel="noopener">${icon('book')}Инструкция</a></header><div class="sys-grid" id="sys"><div class="skeleton"></div><div class="skeleton"></div></div>`;
   const [s, g, devs, net, cloud] = await Promise.all([store.system(), store.chains(), store.devices(),
     store.net().catch(() => null), store.cloud().catch(() => null)]);
+  if (isStale(seq) || !$('#sys')) return;
   $('#sys').innerHTML = pausePanel(s.pause) + phonesPanel(devs.items, net) + netPanel(net) + cloudPanel(cloud) + systemPanels(s, g);
   $('#pause-toggle')?.addEventListener('click', async (e) => {
     e.currentTarget.disabled = true;
@@ -1796,8 +1819,9 @@ function connCardHtml(c, diag, checking) {
     <div class="btn-row"><button class="btn" id="check-now" ${checking ? 'disabled' : ''}>${icon('refresh')}Проверить связь</button></div>`;
 }
 
-async function renderDeviceSystem() {
+async function renderDeviceSystem(seq = navSeq) {
   const c = await store.connection();
+  if (isStale(seq)) return;
   view.innerHTML = `<header class="page-head"><h1 class="h1">Связь и система</h1></header>
     <div class="sys-grid" id="sys">
       <section class="panel wide conn-card" id="conn-card">${connCardHtml(c, null, true)}</section>
@@ -1859,8 +1883,9 @@ async function loadPcPanels() {
 // =====================================================================
 // Инструкция для телефона (режим ПК, открывается в браузере телефона)
 // =====================================================================
-async function renderPhoneSetup() {
+async function renderPhoneSetup(seq = navSeq) {
   const net = await store.net();
+  if (isStale(seq)) return;
   const lanApp = net.endpoints.lan[0];
   const wanReady = net.endpoints.wan.length > 0 && !!net.acme?.valid_until;
   const caSteps = `

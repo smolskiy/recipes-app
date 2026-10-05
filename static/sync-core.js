@@ -23,16 +23,38 @@ function openDB() {
     req.onerror = () => reject(req.error);
   });
 }
-const getDB = () => (dbPromise ||= openDB());
+// Браузер может закрыть соединение с базой (нехватка памяти — Xiaomi делает это охотно) или открытие
+// может зависнуть после сна: тогда открываем заново, а не ждём вечно.
+function getDB() {
+  if (!dbPromise) {
+    dbPromise = Promise.race([openDB(), new Promise((_, rej) => setTimeout(() => rej(new Error('Хранилище на телефоне не ответило — попробуйте ещё раз')), 5000))])
+      .then((db) => {
+        db.onclose = () => { dbPromise = null; };
+        db.onversionchange = () => { db.close(); dbPromise = null; };
+        return db;
+      })
+      .catch((e) => { dbPromise = null; throw e; });
+  }
+  return dbPromise;
+}
+async function tx(store, mode = 'readonly') {
+  for (let attempt = 0; ; attempt++) {
+    const db = await getDB();
+    try { return db.transaction(store, mode); } catch (e) {
+      if (e.name !== 'InvalidStateError' || attempt) throw e; // соединение уже закрыто — одна попытка заново
+      dbPromise = null;
+    }
+  }
+}
 const reqP = (req) => new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
 const txDone = (t) => new Promise((res, rej) => { t.oncomplete = () => res(); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); });
 
-export async function dbGet(store, key) { const db = await getDB(); return reqP(db.transaction(store).objectStore(store).get(key)); }
-export async function dbAll(store) { const db = await getDB(); return reqP(db.transaction(store).objectStore(store).getAll()); }
-export async function dbPut(store, value) { const db = await getDB(); const t = db.transaction(store, 'readwrite'); t.objectStore(store).put(value); return txDone(t); }
-export async function dbPutMany(store, values) { if (!values.length) return; const db = await getDB(); const t = db.transaction(store, 'readwrite'); const s = t.objectStore(store); values.forEach((v) => s.put(v)); return txDone(t); }
-export async function dbDel(store, key) { const db = await getDB(); const t = db.transaction(store, 'readwrite'); t.objectStore(store).delete(key); return txDone(t); }
-export async function dbClear(store) { const db = await getDB(); const t = db.transaction(store, 'readwrite'); t.objectStore(store).clear(); return txDone(t); }
+export async function dbGet(store, key) { return reqP((await tx(store)).objectStore(store).get(key)); }
+export async function dbAll(store) { return reqP((await tx(store)).objectStore(store).getAll()); }
+export async function dbPut(store, value) { const t = await tx(store, 'readwrite'); t.objectStore(store).put(value); return txDone(t); }
+export async function dbPutMany(store, values) { if (!values.length) return; const t = await tx(store, 'readwrite'); const s = t.objectStore(store); values.forEach((v) => s.put(v)); return txDone(t); }
+export async function dbDel(store, key) { const t = await tx(store, 'readwrite'); t.objectStore(store).delete(key); return txDone(t); }
+export async function dbClear(store) { const t = await tx(store, 'readwrite'); t.objectStore(store).clear(); return txDone(t); }
 
 export const kv = {
   async get(k, fallback = null) { const row = await dbGet('kv', k); return row ? row.v : fallback; },

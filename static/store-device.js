@@ -178,7 +178,7 @@ export const deviceStore = {
   },
   async chains() {
     try {
-      const res = await core.api('/api/grocery/chains');
+      const res = await core.api('/api/grocery/chains', { timeout: 8000 });
       await core.kv.set('chains', res);
       return res;
     } catch (e) {
@@ -196,13 +196,27 @@ export const deviceStore = {
   refreshCatalog: (chain) => online(() => core.api(`/api/grocery/catalog/${chain}/refresh`, { method: 'POST' })),
   geocode: (query) => online(() => core.api('/api/grocery/geocode', { method: 'POST', body: { query } })),
   setLocation: (loc) => online(() => core.api('/api/grocery/location', { method: 'POST', body: loc, timeout: 120000 })),
+  // Ограничения меняются редко: сразу отдаём сохранённые, свежие запрашиваем фоном.
   async limits() {
-    try { const l = await core.api('/api/limits'); await core.kv.set('limits', l); return l; }
-    catch { return core.kv.get('limits'); }
+    const fresh = core.api('/api/limits', { timeout: 8000 }).then(async (l) => { await core.kv.set('limits', l); return l; });
+    const cached = await core.kv.get('limits');
+    if (cached) { fresh.catch(() => {}); return cached; }
+    return fresh.catch(() => null);
   },
-  system: () => online(() => core.api('/api/system')),
+  system: () => online(() => core.api('/api/system', { timeout: 10000 })),
   activeCount: () => core.activeJobs(),
-  async connection() {
+  // lite — для строки связи (каждые 15 с): без чтения всех рецептов с телефона.
+  async connection({ lite = false } = {}) {
+    if (lite) {
+      return {
+        paired: !!(await core.kv.get('token')),
+        conn: await core.kv.get('conn', { state: 'unknown' }),
+        lastSync: await core.kv.get('lastSync'),
+        lastOnline: await core.kv.get('lastOnline'),
+        pending: (await core.dbAll('outbox')).filter((i) => i.state === 'pending').length,
+        authLost: await core.kv.get('authLost', false),
+      };
+    }
     return {
       paired: !!(await core.kv.get('token')),
       device: await core.kv.get('device'),

@@ -399,6 +399,11 @@ body.cooking .timer-tray.floating { display: none; }
 .timer-pill.done { background: var(--tomato); color: #fff; animation: pulse 1s ease-in-out infinite; }
 
 /* ---------- Режим «Готовить по шагам» ---------- */
+/* Переход между вкладками дольше мгновения — тонкая бегущая полоска сверху, чтобы было видно: нажатие принято. */
+body.routing::before {
+  content: ""; position: fixed; z-index: 100; top: 0; left: 0; width: 40%; height: 3px; border-radius: 0 2px 2px 0;
+  background: var(--cobalt); animation: indet 1.1s ease-in-out infinite;
+}
 body.cooking { overflow: hidden; }
 body.cooking .nav, body.cooking .conn { display: none; }
 .cook {
