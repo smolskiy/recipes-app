@@ -1876,6 +1876,43 @@ async function renderPhoneSetup() {
   });
 }
 
+// ---------- Обновление приложения ----------
+// Новая версия (опубликованная на GitHub Pages) ставится сама: браузер проверяет её при открытии,
+// а мы — ещё и при каждом возвращении в приложение и раз в час (iPhone держит приложение в памяти
+// и не перезапускает его). Как только новая версия встала — перезагружаемся, если ничего не прервём.
+function setupUpdates() {
+  let hadController = !!navigator.serviceWorker.controller; // при самой первой установке перезагружать нечего
+  navigator.serviceWorker.register('sw.js', { type: 'module', scope: './' }).then((reg) => {
+    const check = () => reg.update().catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    setInterval(check, 3600 * 1000);
+  }).catch((e) => console.warn('SW', e));
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    const wasControlled = hadController;
+    hadController = true;
+    if (!wasControlled || applyUpdate.done) return;
+    applyUpdate();
+  });
+  if (sessionStorage.getItem('updated')) {
+    sessionStorage.removeItem('updated');
+    setTimeout(() => toast('Приложение обновлено', 2500), 600);
+  }
+}
+
+function applyUpdate() {
+  // Человек что-то вводит: значение поля отличается от исходного.
+  const typing = $$('input:not([type=checkbox]):not([type=search]), textarea').some((el) => el.value.trim() && el.value !== el.defaultValue);
+  const busy = document.querySelector('.cook') || /\/edit$/.test(location.hash) || typing || dialog.open;
+  if (busy) {
+    // Не перебиваем готовку и правку — новая версия откроется в следующий раз.
+    toast('Вышла новая версия приложения — она откроется при следующем запуске', 4000);
+    return;
+  }
+  applyUpdate.done = true;
+  sessionStorage.setItem('updated', '1');
+  location.reload();
+}
+
 // ---------- Старт ----------
 async function start() {
   await store.init();
@@ -1883,9 +1920,7 @@ async function start() {
     document.querySelector('[data-nav="system"] span').textContent = 'Связь';
     connEl.addEventListener('click', () => { location.hash = '#/system'; });
     await store.core.kv.set('originIsPc', ORIGIN_IS_PC);
-    if ('serviceWorker' in navigator && (isSecureContext || NATIVE)) {
-      navigator.serviceWorker.register('sw.js', { type: 'module', scope: './' }).catch((e) => console.warn('SW', e));
-    }
+    if ('serviceWorker' in navigator && (isSecureContext || NATIVE)) setupUpdates();
     const onSync = async (ev) => {
       const t = ev.data?.type;
       if (t === 'conn' || t === 'outbox' || t === 'synced' || t === 'sync-error') renderConn();

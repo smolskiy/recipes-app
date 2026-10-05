@@ -5,7 +5,7 @@
 
 import { enqueue, extractUrl, syncAll } from './static/sync-core.js';
 
-const VERSION = 'f5c4c7242613';
+const VERSION = 'cfe6ca1b5f0c';
 const CACHE = `recipes-shell-${VERSION}`;
 const SHELL = [
   './', 'manifest.webmanifest',
@@ -17,7 +17,11 @@ const SHELL = [
 const scopeUrl = (p) => new URL(p, self.registration.scope).href;
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL.map(scopeUrl))).then(() => self.skipWaiting()));
+  // cache: 'reload' — мимо HTTP-кэша браузера: GitHub Pages разрешает держать файлы 10 минут,
+  // и без этого новая версия могла бы сохранить у себя старые файлы.
+  event.waitUntil(caches.open(CACHE)
+    .then((c) => c.addAll(SHELL.map((p) => new Request(scopeUrl(p), { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
